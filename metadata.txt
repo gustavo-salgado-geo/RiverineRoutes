@@ -1,0 +1,23 @@
+[general]
+name=RiverineRoutes
+qgisMinimumVersion=3.22
+description=Ferramentas para roteamento fluvial intermodal: extração de máscaras de água, redes de navegação e integração topológica terra-rio.
+version=0.1
+author=Gustavo Piva Lopes Salgado
+email=gpl.salgado@gmail.com
+icon=icon.png
+
+about=O RiverineRoutes é um plugin focado em hidrologia e navegação. Ele permite: 1) Extrair máscaras de água usando NDWI; 2) Gerar rotas centrais (esqueleto), marginais (buffers) e transversais (transectos); 3) Integrar topologicamente redes terrestres e fluviais para análises de rede e roteamento. Utiliza lógicas espaciais avançadas (skimage, geopandas, shapely).
+
+tracker=https://github.com/seu-usuario/RiverineRoutes/issues
+repository=https://github.com/seu-usuario/RiverineRoutes
+
+# Categoria do plugin (Ex: Vector, Raster, Web, Processing)
+category=Processing
+
+# Tags separadas por vírgula para facilitar a busca no repositório do QGIS
+tags=hidrologia, roteamento, rios, navegação, ndwi, esqueleto, topologia, network
+
+# IMPORTANTE: Como criámos ferramentas de processamento (Provider), 
+# esta variável deve ser "yes" ou "True" para o QGIS saber que tem algoritmos para carregar.
+hasProcessingProvider=yes
