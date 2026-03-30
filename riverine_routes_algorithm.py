@@ -299,143 +299,191 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         tmp = context.temporaryFolder()
 
         # ── 2. Detectar CRS e reprojetar se necessário ──────────────────
+        #
+        # FONTE DE VERDADE: os objetos QgsRasterLayer / QgsVectorLayer do QGIS.
+        # O QGIS pode ter o SRC definido na camada em memória mesmo quando o
+        # ficheiro físico não gravou os metadados de projeção. Usar rasterio/
+        # geopandas diretamente no ficheiro falha nesses casos.
+        # Rasterio e geopandas são usados apenas como fallback de último recurso.
+        # -----------------------------------------------------------------
         feedback.pushInfo(self.tr("A verificar SRC dos dados de entrada..."))
 
-        # ---- 2a. Ler CRS do raster ----------------------------------------
-        with rasterio.open(raster_path_orig) as src:
-            raw_raster_crs = src.crs          # pode ser None se o ficheiro não tiver SRC
-            raster_bounds  = src.bounds
-            raster_transform = src.transform
+        # ---- 2a. CRS do raster — fonte primária: QgsRasterLayer -----------
+        qgs_raster_crs = raster_layer.crs()          # QgsCoordinateReferenceSystem
+        raster_crs_wkt = None
+        raster_is_geo  = None
 
-        if raw_raster_crs is None:
-            # Sem SRC no raster: tentar ler do vetor para decidir o UTM.
-            # Se o vetor também não tiver SRC, o processamento é interrompido.
-            feedback.pushWarning(
-                self.tr(
-                    "AVISO: O raster não tem SRC definido (CRS ausente no ficheiro). "
-                    "O algoritmo tentará usar o SRC do vetor para determinar a zona UTM. "
-                    "Se o resultado não for correto, defina o SRC do raster no QGIS "
-                    "(Raster → Projeções → Atribuir SRC) e execute novamente."
-                )
-            )
-            raster_crs_wkt = None
-            raster_is_geo  = None       # indeterminado — será resolvido via vetor
-        else:
-            raster_crs_wkt = raw_raster_crs.to_wkt()
+        if qgs_raster_crs.isValid():
+            raster_crs_wkt = qgs_raster_crs.toWkt()
             raster_is_geo  = _is_geographic(raster_crs_wkt)
-
-        # ---- 2b. Ler CRS do vetor -----------------------------------------
-        gdf_check = _read_vector(vector_path_orig)
-
-        if gdf_check.crs is None:
-            if raster_crs_wkt is None:
-                # Nenhum dos dois tem SRC — não é possível continuar
-                feedback.reportError(
-                    self.tr(
-                        "ERRO: Nem o raster nem o vetor têm SRC definido. "
-                        "Atribua o SRC correto a ambas as camadas no QGIS e tente novamente."
-                    ),
-                    fatalError=True,
-                )
-                return {}
-            # Vetor sem SRC mas raster tem: assumir mesmo SRC que o raster
-            feedback.pushWarning(
+            feedback.pushInfo(
                 self.tr(
-                    "AVISO: O vetor não tem SRC definido. "
-                    "Assumindo o mesmo SRC do raster. "
-                    "Verifique se este comportamento está correto para os seus dados."
+                    f"SRC do raster lido do QGIS: "
+                    f"{qgs_raster_crs.authid()} — "
+                    f"{'Geográfico (graus)' if raster_is_geo else 'Projetado (métrico)'}"
                 )
             )
-            vector_epsg   = None
-            vector_is_geo = raster_is_geo
         else:
-            vector_epsg   = gdf_check.crs.to_epsg()
-            vector_is_geo = gdf_check.crs.is_geographic
+            # Fallback: tentar rasterio diretamente no ficheiro
+            try:
+                with rasterio.open(raster_path_orig) as src:
+                    if src.crs is not None:
+                        raster_crs_wkt = src.crs.to_wkt()
+                        raster_is_geo  = _is_geographic(raster_crs_wkt)
+                        feedback.pushInfo(
+                            self.tr(
+                                f"SRC do raster lido via rasterio: "
+                                f"{'Geográfico' if raster_is_geo else 'Projetado'}"
+                            )
+                        )
+            except Exception:
+                pass
+            if raster_crs_wkt is None:
+                feedback.pushWarning(
+                    self.tr(
+                        "AVISO: O raster não tem SRC definido nem no QGIS nem no ficheiro. "
+                        "O algoritmo tentará usar o SRC do vetor. "
+                        "Para evitar este aviso, atribua o SRC ao raster no QGIS "
+                        "(Raster → Projeções → Atribuir SRC)."
+                    )
+                )
 
-        # ---- 2c. Determinar EPSG de trabalho (métrico) --------------------
+        # ---- 2b. CRS do vetor — fonte primária: QgsVectorLayer ------------
+        qgs_vector_crs = vector_layer.crs()
+        vector_epsg    = None
+        vector_is_geo  = None
+
+        if qgs_vector_crs.isValid():
+            vector_crs_wkt = qgs_vector_crs.toWkt()
+            vector_is_geo  = _is_geographic(vector_crs_wkt)
+            try:
+                auth_id = qgs_vector_crs.authid()   # ex: "EPSG:31982"
+                if auth_id.upper().startswith("EPSG:"):
+                    vector_epsg = int(auth_id.split(":")[1])
+            except Exception:
+                vector_epsg = None
+            feedback.pushInfo(
+                self.tr(
+                    f"SRC do vetor lido do QGIS: "
+                    f"{qgs_vector_crs.authid()} — "
+                    f"{'Geográfico (graus)' if vector_is_geo else 'Projetado (métrico)'}"
+                )
+            )
+        else:
+            # Fallback: tentar geopandas
+            try:
+                gdf_crs_check = _read_vector(vector_path_orig)
+                if gdf_crs_check.crs is not None:
+                    vector_epsg   = gdf_crs_check.crs.to_epsg()
+                    vector_is_geo = gdf_crs_check.crs.is_geographic
+                    feedback.pushInfo(
+                        self.tr(
+                            f"SRC do vetor lido via geopandas: EPSG:{vector_epsg}"
+                        )
+                    )
+            except Exception:
+                pass
+            if vector_is_geo is None:
+                feedback.pushWarning(
+                    self.tr(
+                        "AVISO: O vetor não tem SRC definido nem no QGIS nem no ficheiro."
+                    )
+                )
+
+        # ---- 2c. Ambos sem SRC — erro fatal --------------------------------
+        if raster_crs_wkt is None and vector_is_geo is None:
+            feedback.reportError(
+                self.tr(
+                    "ERRO: Nao foi possivel determinar o SRC do raster nem do vetor. "
+                    "Atribua o SRC correto a ambas as camadas no QGIS e tente novamente. "
+                    "Raster: clique direito → Propriedades → SRC ou Raster → Projecoes → Atribuir SRC. "
+                    "Vetor: clique direito na camada → Definir SRC da Camada."
+                ),
+                fatalError=True,
+            )
+            return {}
+
+        # ---- 2d. Determinar EPSG de trabalho (métrico) --------------------
         #
-        # Ordem de prioridade:
-        #   1. CRS do raster, se métrico
-        #   2. CRS do vetor, se métrico
-        #   3. Auto-UTM calculado a partir do centro do raster (se geográfico)
-        #   4. Auto-UTM calculado a partir do centro do vetor (se geográfico)
+        # Prioridade: (1) raster métrico → usa direto
+        #             (2) raster geográfico → calcula UTM pelo centro do raster
+        #             (3) raster sem SRC + vetor métrico → usa EPSG do vetor
+        #             (4) raster sem SRC + vetor geográfico → calcula UTM pelo centroide do vetor
 
         work_epsg = None
 
         if raster_crs_wkt is not None and not raster_is_geo:
+            # Caso 1: raster já métrico
             try:
                 proj_crs = ProjCRS.from_wkt(raster_crs_wkt)
                 auth     = proj_crs.to_authority()
                 work_epsg = int(auth[1]) if auth else None
             except Exception:
-                work_epsg = None
+                # Se não conseguir extrair EPSG numérico, tenta pelo authid do QGIS
+                try:
+                    auth_id = qgs_raster_crs.authid()
+                    if auth_id.upper().startswith("EPSG:"):
+                        work_epsg = int(auth_id.split(":")[1])
+                except Exception:
+                    work_epsg = None
             feedback.pushInfo(
                 self.tr(
-                    f"SRC do raster já é métrico "
-                    f"{'(EPSG:' + str(work_epsg) + ')' if work_epsg else '(EPSG desconhecido)'}. "
-                    f"Usando como SRC de trabalho."
+                    f"SRC de trabalho: EPSG:{work_epsg} (raster métrico, sem reprojeção)."
                 )
             )
             raster_path = raster_path_orig
 
         elif raster_crs_wkt is not None and raster_is_geo:
+            # Caso 2: raster geográfico → reprojetar para UTM
             lon, lat  = _get_raster_center_lonlat(raster_path_orig)
             work_epsg = _auto_utm_epsg(lon, lat)
             feedback.pushInfo(
                 self.tr(
-                    f"SRC do raster é geográfico (graus). "
-                    f"Reprojetando automaticamente para EPSG:{work_epsg} (UTM)..."
+                    f"SRC do raster é geográfico. "
+                    f"Reprojetando para EPSG:{work_epsg} (UTM)..."
                 )
             )
             raster_path = _reproject_raster_to_metric(raster_path_orig, work_epsg, tmp)
 
-        else:
-            # raster sem SRC — tentar via vetor
-            if gdf_check.crs is not None:
-                if vector_is_geo:
-                    cx = gdf_check.geometry.unary_union.centroid.x
-                    cy = gdf_check.geometry.unary_union.centroid.y
-                    work_epsg = _auto_utm_epsg(cx, cy)
-                    feedback.pushInfo(
-                        self.tr(
-                            f"Raster sem SRC. SRC do vetor é geográfico. "
-                            f"Usando EPSG:{work_epsg} (UTM auto) como SRC de trabalho."
-                        )
-                    )
-                else:
-                    work_epsg = vector_epsg
-                    feedback.pushInfo(
-                        self.tr(
-                            f"Raster sem SRC. Usando SRC do vetor "
-                            f"(EPSG:{work_epsg}) como SRC de trabalho."
-                        )
-                    )
-            else:
-                feedback.reportError(
-                    self.tr(
-                        "ERRO: Não foi possível determinar um SRC de trabalho. "
-                        "Atribua o SRC correto ao raster ou ao vetor e tente novamente."
-                    ),
-                    fatalError=True,
-                )
-                return {}
-
-            # Reprojetar raster sem SRC: atribuir o work_epsg primeiro,
-            # depois reprojetar se necessário (aqui apenas atribuímos pois
-            # não sabemos a projeção original — o utilizador foi avisado).
+        elif vector_is_geo is not None and not vector_is_geo and vector_epsg:
+            # Caso 3: raster sem SRC, vetor já métrico
+            work_epsg = vector_epsg
             feedback.pushWarning(
                 self.tr(
-                    f"Raster sem SRC: será processado assumindo EPSG:{work_epsg}. "
-                    f"Se os resultados forem incorretos, atribua o SRC real ao raster."
+                    f"Raster sem SRC. Usando SRC do vetor (EPSG:{work_epsg}) como SRC de trabalho. "
+                    f"Atribua o SRC real ao raster para evitar este aviso."
                 )
             )
             raster_path = raster_path_orig
 
-        # ---- 2d. Reprojetar vetor se necessário ---------------------------
+        else:
+            # Caso 4: raster sem SRC, vetor geográfico → UTM pelo centroide do vetor
+            try:
+                gdf_tmp = _read_vector(vector_path_orig)
+                cx = gdf_tmp.geometry.unary_union.centroid.x
+                cy = gdf_tmp.geometry.unary_union.centroid.y
+                work_epsg = _auto_utm_epsg(cx, cy)
+            except Exception:
+                feedback.reportError(
+                    self.tr(
+                        "ERRO: Não foi possível calcular o UTM automático. "
+                        "Atribua o SRC correto ao raster e tente novamente."
+                    ),
+                    fatalError=True,
+                )
+                return {}
+            feedback.pushWarning(
+                self.tr(
+                    f"Raster sem SRC e vetor geográfico. "
+                    f"Usando EPSG:{work_epsg} (UTM auto pelo centroide do vetor) "
+                    f"como SRC de trabalho."
+                )
+            )
+            raster_path = raster_path_orig
+
+        # ---- 2e. Reprojetar vetor se necessário ---------------------------
         needs_vector_reproject = False
-        if gdf_check.crs is None:
-            needs_vector_reproject = False   # sem CRS — usamos como está, já avisamos
-        elif vector_is_geo:
+        if vector_is_geo is True:
             needs_vector_reproject = True
         elif work_epsg and vector_epsg and vector_epsg != work_epsg:
             needs_vector_reproject = True
@@ -449,8 +497,16 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
             vector_path = _reproject_vector_to_metric(vector_path_orig, work_epsg, tmp)
         else:
-            feedback.pushInfo(self.tr("SRC do vetor compatível. Sem necessidade de reprojeção."))
+            feedback.pushInfo(
+                self.tr(
+                    f"SRC do vetor compativel com SRC de trabalho (EPSG:{work_epsg}). "
+                    f"Sem necessidade de reprojecao."
+                )
+            )
             vector_path = vector_path_orig
+
+        # Leitura do GeoDataFrame do vetor (para uso nas etapas seguintes)
+        gdf_check = _read_vector(vector_path)
 
         feedback.pushInfo(
             self.tr(
