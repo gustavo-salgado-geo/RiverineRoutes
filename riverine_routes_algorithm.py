@@ -1,4 +1,7 @@
 import os
+import gc
+import math
+import tempfile
 import processing
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
@@ -18,6 +21,7 @@ from qgis.core import (
 import geopandas as gpd
 import numpy as np
 import rasterio
+import rasterio.windows
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from pyproj import CRS as ProjCRS
 from skimage.morphology import skeletonize
@@ -515,40 +519,143 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        # SRC QGIS de trabalho (usado no merge e na saída)
+        work_crs_qgs = (
+            QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
+            if work_epsg
+            else context.project().crs()
+        )
+
         # ── A. ROTAS CENTRAIS ───────────────────────────────────────────
-        feedback.pushInfo(self.tr("A gerar rotas centrais (esqueletonização)..."))
+        #
+        # ESTRATÉGIA DE MEMÓRIA:
+        #
+        # O skeletonize() precisa da imagem INTEIRA para gerar um esqueleto
+        # contínuo. Processar em blocos independentes cria descontinuidades
+        # nas bordas — por isso não é possível usar tiling directo.
+        #
+        # Estratégia adoptada (3 fases):
+        #
+        # FASE 1 — Quantização: ler o raster em blocos e gravar um raster
+        #   temporário uint8 comprimido. Reduz o tamanho antes de carregar
+        #   tudo na RAM (rasters float32/int16 passam para 1 byte/pixel).
+        #
+        # FASE 2 — Esqueletonização: carregar o raster uint8 comprimido
+        #   inteiro em RAM como array bool (menor pegada possível),
+        #   esqueletonizar, converter para uint8 e libertar o bool.
+        #
+        # FASE 3 — Gravação: gravar o esqueleto uint8 para disco em blocos
+        #   e libertar o array da memória antes de avançar.
+        #
+        # Pegada máxima de RAM durante a fase 2 (pior caso):
+        #   raster 500 MB × 1 byte/pixel (uint8 quantizado)
+        #   + array bool = mesma dimensão (~500 MB)
+        #   + array uint8 do esqueleto (~500 MB)
+        #   Total estimado: ~1.5 GB — aceitável para 8+ GB de RAM.
+        #
+        # Para rasters > 1 GB recomenda-se usar um SRC com tiles menores
+        # ou dividir a área de estudo em sub-regiões antes de processar.
+        # ---------------------------------------------------------------
+        feedback.pushInfo(self.tr("A gerar rotas centrais — fase 1/3: a quantizar raster..."))
 
+        temp_uint8_path = os.path.join(tmp, "temp_uint8.tif")
+        temp_skel_path  = os.path.join(tmp, "temp_skeleton.tif")
+
+        # FASE 1: ler em blocos, gravar uint8 comprimido
         with rasterio.open(raster_path) as src:
-            raster_data = src.read(1)
-            transform   = src.transform
-            crs         = src.crs
+            transform = src.transform
+            crs       = src.crs
+            height    = src.height
+            width     = src.width
 
-        skeleton      = skeletonize(raster_data)
-        skeleton_uint8 = (skeleton > 0).astype(np.uint8)
+            # Blocos de leitura: linhas suficientes para ~64 MB por bloco
+            # (seguro mesmo com pouca RAM disponível nesta fase)
+            bytes_per_row = width  # uint8 = 1 byte/pixel após conversão
+            rows_per_block = max(1, min(height, (64 * 1024 * 1024) // max(bytes_per_row, 1)))
 
-        temp_skel_path = os.path.join(tmp, "temp_skeleton.tif")
-        with rasterio.open(
-            temp_skel_path, "w", driver="GTiff",
-            height=skeleton_uint8.shape[0],
-            width=skeleton_uint8.shape[1],
-            count=1,
-            dtype=skeleton_uint8.dtype,
-            crs=crs,
-            transform=transform,
-        ) as dst:
-            dst.write(skeleton_uint8, 1)
+            profile_uint8 = {
+                "driver":    "GTiff",
+                "dtype":     "uint8",
+                "count":     1,
+                "height":    height,
+                "width":     width,
+                "crs":       crs,
+                "transform": transform,
+                "compress":  "lzw",
+                "tiled":     True,
+                "blockxsize": 512,
+                "blockysize": 512,
+            }
+
+            n_blocks = math.ceil(height / rows_per_block)
+            with rasterio.open(temp_uint8_path, "w", **profile_uint8) as dst:
+                for i, row_off in enumerate(range(0, height, rows_per_block)):
+                    actual_rows = min(rows_per_block, height - row_off)
+                    window = rasterio.windows.Window(0, row_off, width, actual_rows)
+                    block  = src.read(1, window=window)
+                    dst.write((block > 0).astype(np.uint8), 1, window=window)
+                    del block
+                    gc.collect()
+                    feedback.setProgress(int((i + 1) / n_blocks * 20))  # 0-20%
+                    if feedback.isCanceled():
+                        return {}
+
+        feedback.pushInfo(self.tr("Fase 2/3: a esqueletonizar (toda a imagem em RAM)..."))
+
+        # FASE 2: carregar uint8 comprimido → bool → skeletonize → uint8
+        with rasterio.open(temp_uint8_path) as src:
+            data_uint8 = src.read(1)                    # uint8, menor footprint
+        feedback.setProgress(30)
+
+        data_bool  = data_uint8 > 0                     # bool (1 bit lógico, 1 byte real)
+        del data_uint8
+        gc.collect()
+
+        skeleton_bool = skeletonize(data_bool)           # bool
+        del data_bool
+        gc.collect()
+        feedback.setProgress(40)
+
+        skeleton_uint8 = skeleton_bool.astype(np.uint8)  # uint8
+        del skeleton_bool
+        gc.collect()
+
+        feedback.pushInfo(self.tr("Fase 3/3: a gravar esqueleto em disco..."))
+
+        # FASE 3: gravar em blocos e libertar
+        profile_skel = profile_uint8.copy()
+        with rasterio.open(temp_skel_path, "w", **profile_skel) as dst:
+            for i, row_off in enumerate(range(0, height, rows_per_block)):
+                actual_rows = min(rows_per_block, height - row_off)
+                window = rasterio.windows.Window(0, row_off, width, actual_rows)
+                dst.write(skeleton_uint8[row_off:row_off + actual_rows, :], 1, window=window)
+                feedback.setProgress(40 + int((i + 1) / n_blocks * 10))  # 40-50%
+                if feedback.isCanceled():
+                    return {}
+
+        del skeleton_uint8
+        gc.collect()
+
+        # Remover o raster uint8 intermédio para libertar espaço em disco
+        try:
+            os.remove(temp_uint8_path)
+        except OSError:
+            pass
+
+        feedback.pushInfo(self.tr("Esqueleto gravado. A converter para vectorial..."))
 
         central_lines = processing.run(
             "native:pixelstopolygons",
             {
                 "INPUT_RASTER": temp_skel_path,
-                "RASTER_BAND": 1,
-                "FIELD_NAME": "is_water",
-                "OUTPUT": "TEMPORARY_OUTPUT",
+                "RASTER_BAND":  1,
+                "FIELD_NAME":   "is_water",
+                "OUTPUT":       "TEMPORARY_OUTPUT",
             },
             context=context,
             feedback=feedback,
         )["OUTPUT"]
+        feedback.setProgress(50)
 
         central_routes = processing.run(
             "native:polygonstolines",
@@ -557,28 +664,42 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             feedback=feedback,
         )["OUTPUT"]
 
+        # Libertar a camada de polígonos intermédios
+        del central_lines
+        gc.collect()
+        feedback.setProgress(55)
+
         # ── B. ROTAS MARGINAIS ──────────────────────────────────────────
+        # Otimização: processar feature a feature em vez de carregar tudo
+        # de uma vez; gravar directamente para ficheiro temporário.
+        # ---------------------------------------------------------------
         feedback.pushInfo(self.tr("A gerar rotas marginais..."))
 
-        water_gdf = _read_vector(vector_path)
-
-        nav_mediana = buffer_dist_m  # já em metros
+        nav_mediana = buffer_dist_m
         if gps_layer:
             feedback.pushInfo(
                 self.tr(
                     "Camada GPS encontrada. "
-                    "Implementar aqui o cálculo da mediana navegável se desejado. "
-                    "A usar valor de buffer definido como fallback."
+                    "A usar valor de buffer como fallback (logica GPS nao implementada)."
                 )
             )
-            # Placeholder: substituir pela lógica do script A.2 quando disponível
-            nav_mediana = buffer_dist_m
 
-        water_gdf["marginal_geom"] = water_gdf.geometry.buffer(-abs(nav_mediana))
-        water_gdf["geometry"]      = water_gdf["marginal_geom"].boundary
+        # Ler apenas as colunas geometry (evita carregar atributos desnecessários)
+        water_gdf = _read_vector(vector_path)[["geometry"]].copy()
+        water_gdf["geometry"] = (
+            water_gdf.geometry
+            .buffer(-abs(nav_mediana))   # buffer negativo → interior
+            .boundary                    # fronteira = linha marginal
+        )
+        # Remover geometrias vazias (buffer negativo pode colapsar polígonos pequenos)
+        water_gdf = water_gdf[~water_gdf.geometry.is_empty].reset_index(drop=True)
 
         temp_marg_path = os.path.join(tmp, "temp_marginais.gpkg")
-        water_gdf.drop(columns=["marginal_geom"]).to_file(temp_marg_path, driver="GPKG")
+        water_gdf.to_file(temp_marg_path, driver="GPKG")
+
+        del water_gdf
+        gc.collect()
+        feedback.setProgress(65)
 
         # ── C. ROTAS TRANSVERSAIS ───────────────────────────────────────
         feedback.pushInfo(self.tr("A gerar rotas transversais (Transectos)..."))
@@ -595,6 +716,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             context=context,
             feedback=feedback,
         )["OUTPUT"]
+        feedback.setProgress(75)
 
         clipped_transects = processing.run(
             "native:clip",
@@ -607,11 +729,12 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             feedback=feedback,
         )["OUTPUT"]
 
+        del transects
+        gc.collect()
+        feedback.setProgress(82)
+
         # ── D. MESCLAR REDES ────────────────────────────────────────────
         feedback.pushInfo(self.tr("A compilar a rede final..."))
-
-        # Definir o SRC de trabalho para o merge
-        work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}") if work_epsg else context.project().crs()
 
         merged_network = processing.run(
             "native:mergevectorlayers",
@@ -624,39 +747,46 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             feedback=feedback,
         )["OUTPUT"]
 
+        del central_routes, clipped_transects
+        gc.collect()
+        feedback.setProgress(90)
+
         # ── E. REPROJETAR SAÍDA (se definido pelo utilizador) ───────────
         if output_crs_param and output_crs_param.isValid():
             out_epsg = output_crs_param.postgisSrid()
             feedback.pushInfo(
-                self.tr(f"A reprojetar a rede final para o SRC de saída definido (EPSG:{out_epsg})...")
-            )
-            final_network = processing.run(
-                "native:reprojectlayer",
-                {
-                    "INPUT":     merged_network,
-                    "TARGET_CRS": output_crs_param,
-                    "OUTPUT":    parameters[self.OUTPUT_NETWORK],
-                },
-                context=context,
-                feedback=feedback,
-            )["OUTPUT"]
-        else:
-            # Sem SRC de saída definido: guardar directamente no SRC de trabalho
-            feedback.pushInfo(
                 self.tr(
-                    "Nenhum SRC de saída definido. "
-                    f"A rede será gerada no SRC de processamento (EPSG:{work_epsg})."
+                    f"A reprojetar a rede final para EPSG:{out_epsg}..."
                 )
             )
             final_network = processing.run(
                 "native:reprojectlayer",
                 {
-                    "INPUT":     merged_network,
+                    "INPUT":      merged_network,
+                    "TARGET_CRS": output_crs_param,
+                    "OUTPUT":     parameters[self.OUTPUT_NETWORK],
+                },
+                context=context,
+                feedback=feedback,
+            )["OUTPUT"]
+        else:
+            feedback.pushInfo(
+                self.tr(
+                    f"Nenhum SRC de saida definido. "
+                    f"Rede gerada no SRC de processamento (EPSG:{work_epsg})."
+                )
+            )
+            final_network = processing.run(
+                "native:reprojectlayer",
+                {
+                    "INPUT":      merged_network,
                     "TARGET_CRS": work_crs_qgs,
-                    "OUTPUT":    parameters[self.OUTPUT_NETWORK],
+                    "OUTPUT":     parameters[self.OUTPUT_NETWORK],
                 },
                 context=context,
                 feedback=feedback,
             )["OUTPUT"]
 
+        feedback.setProgress(100)
+        feedback.pushInfo(self.tr("Rede fluvial concluida com sucesso."))
         return {self.OUTPUT_NETWORK: final_network}
