@@ -101,12 +101,40 @@ def _reproject_raster_to_metric(raster_path: str, target_epsg: int, tmp_folder: 
     return out_path
 
 
-def _reproject_vector_to_metric(vector_path: str, target_epsg: int, tmp_folder: str) -> str:
+def _parse_vector_source(qgis_source: str):
     """
-    Reprojeta uma camada vetorial para o EPSG métrico indicado.
+    O QGIS representa fontes vetoriais com a sintaxe:
+        /caminho/arquivo.gpkg|layername=nome_da_camada
+        /caminho/arquivo.shp          (sem pipe — shapefile simples)
+
+    O GeoPandas/pyogrio nao entende o '|layername=...' — precisa receber
+    o caminho e o nome da camada separados.
+
+    Devolve: (caminho_do_ficheiro, nome_da_camada_ou_None)
+    """
+    if "|layername=" in qgis_source:
+        parts = qgis_source.split("|layername=", 1)
+        return parts[0], parts[1]
+    # Outros parametros possiveis (|subset=, |geometrytype=, etc.) sao ignorados
+    clean_path = qgis_source.split("|")[0]
+    return clean_path, None
+
+
+def _read_vector(qgis_source: str) -> "gpd.GeoDataFrame":
+    """Le uma camada vetorial a partir de um caminho no formato QGIS."""
+    path, layer = _parse_vector_source(qgis_source)
+    if layer:
+        return gpd.read_file(path, layer=layer)
+    return gpd.read_file(path)
+
+
+def _reproject_vector_to_metric(qgis_source: str, target_epsg: int, tmp_folder: str) -> str:
+    """
+    Reprojeta uma camada vetorial para o EPSG metrico indicado.
+    Aceita caminhos no formato QGIS (com |layername=...).
     Devolve o caminho para o ficheiro reprojetado (.gpkg).
     """
-    gdf = gpd.read_file(vector_path)
+    gdf = _read_vector(qgis_source)
     gdf_reproj = gdf.to_crs(epsg=target_epsg)
     out_path = os.path.join(tmp_folder, f"vector_reproj_{target_epsg}.gpkg")
     gdf_reproj.to_file(out_path, driver="GPKG")
@@ -297,7 +325,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             raster_is_geo  = _is_geographic(raster_crs_wkt)
 
         # ---- 2b. Ler CRS do vetor -----------------------------------------
-        gdf_check = gpd.read_file(vector_path_orig)
+        gdf_check = _read_vector(vector_path_orig)
 
         if gdf_check.crs is None:
             if raster_crs_wkt is None:
@@ -476,7 +504,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         # ── B. ROTAS MARGINAIS ──────────────────────────────────────────
         feedback.pushInfo(self.tr("A gerar rotas marginais..."))
 
-        water_gdf = gpd.read_file(vector_path)
+        water_gdf = _read_vector(vector_path)
 
         nav_mediana = buffer_dist_m  # já em metros
         if gps_layer:
