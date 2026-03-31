@@ -968,4 +968,5 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             
             feedback.setProgress(100)
             feedback.pushInfo(self.tr("Rede fluvial concluida com sucesso."))
-return {self.OUTPUT_NETWORK: final_network}
+            
+            return {self.OUTPUT_NETWORK: final_network}
