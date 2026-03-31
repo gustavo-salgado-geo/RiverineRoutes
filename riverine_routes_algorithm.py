@@ -823,160 +823,229 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         except OSError:
             pass
 
-        feedback.pushInfo(self.tr("Esqueleto gravado. A vectorizar via rasterio.features + GDAL/OGR (streaming)..."))
+        feedback.pushInfo(self.tr("Esqueleto gravado. A vectorizar via rastreio de grafo de pixels..."))
 
-        # ── VECTORIZAÇÃO DO ESQUELETO ───────────────────────────────────
+        # ── VECTORIZAÇÃO DO ESQUELETO — RASTREIO DE GRAFO ──────────────
         #
-        # PROBLEMA com pyproj instalado via pip fora do OSGeo4W:
-        #   Qualquer chamada que passe "EPSG:XXXXX" ao GeoDataFrame
-        #   acaba em pyproj.CRS.from_user_input() — que falha com
-        #   "no database context specified" porque o pyproj do pip
-        #   não tem acesso ao proj.db do OSGeo4W.
+        # PROBLEMA com rasterio.features.shapes() + boundary:
+        #   shapes() agrupa pixels contíguos em POLÍGONOS (regiões de cor
+        #   uniforme). O boundary desses polígonos é o CONTORNO da região,
+        #   não a linha central. Para um esqueleto diagonal, o contorno é
+        #   uma série de quadradinhos perpendiculares ao canal — exactamente
+        #   os "traços" visíveis na imagem.
         #
-        # SOLUÇÃO — usar GDAL/OGR directamente via osgeo.ogr + osgeo.osr:
-        #   • Estas bibliotecas são as do OSGeo4W — têm o contexto PROJ
-        #     correcto por definição (é o mesmo que o QGIS usa).
-        #   • O CRS é definido via osr.SpatialReference().ImportFromEPSG()
-        #     ou ImportFromWkt() — sem passar pelo pyproj do pip.
-        #   • As geometrias são escritas feature a feature com ogr.Feature,
-        #     em batches com Flush() periódico.
-        #   • Estratégia de memória igual à anterior: blocos de ~32 MB,
-        #     flush a cada BATCH_SIZE features, gc.collect() após cada flush.
+        # SOLUÇÃO — rastreio de grafo de pixels (pixel graph tracing):
+        #   1. Carregar o esqueleto inteiro como array bool.
+        #   2. Para cada pixel activo, identificar os seus vizinhos activos
+        #      na vizinhança 8-conexa (Moore neighbourhood).
+        #   3. Os pixels com exactamente 2 vizinhos são "internos" (meio
+        #      de uma linha). Os pixels com 1 vizinho são "terminais"
+        #      (ponta de linha). Os pixels com 3+ vizinhos são "junções".
+        #   4. Percorrer a cadeia de pixels internos entre junções/terminais,
+        #      recolhendo as coordenadas reais (via transform) em ordem.
+        #   5. Cada cadeia torna-se uma LineString. Depois simplify +
+        #      Chaikin para suavizar os degraus da grade.
+        #
+        # MEMÓRIA: o esqueleto uint8 já está em memória (skeleton_uint8
+        # foi gravado no ficheiro mas o array foi libertado). Relemos o
+        # ficheiro comprimido — ocupa muito menos que o raster original.
         # ---------------------------------------------------------------
-        from rasterio.features import shapes as rasterio_shapes
-        from shapely.geometry  import shape as shapely_shape, LineString as ShpLineString
-        from osgeo             import ogr, osr
+        from shapely.geometry import LineString as ShpLineString
+        from osgeo            import ogr, osr
+        from scipy.ndimage    import label as nd_label2
 
+        feedback.pushInfo(self.tr("A carregar esqueleto para rastreio de grafo..."))
+
+        with rasterio.open(temp_skel_path) as src:
+            skel_arr       = src.read(1).astype(bool)
+            skel_transform = src.transform
+            pixel_size     = abs(skel_transform.a)
+
+        feedback.setProgress(51)
+
+        # ── Calcular número de vizinhos 8-conexos para cada pixel ──────
+        # neighbor_kernel já definido acima (nd_convolve + ones 3x3 sem centro)
+        n_neighbors = nd_convolve(
+            skel_arr.astype(np.uint8), neighbor_kernel, mode="constant", cval=0
+        )
+
+        # Classificar pixels
+        terminals  = skel_arr & (n_neighbors == 1)   # ponta
+        internals  = skel_arr & (n_neighbors == 2)   # meio de linha
+        junctions  = skel_arr & (n_neighbors >= 3)   # bifurcação/cruzamento
+        # Pixels isolados (0 vizinhos) — ignorar
+        skel_arr = skel_arr & (n_neighbors >= 1)
+
+        feedback.setProgress(53)
+
+        # ── Função para converter (row, col) → (x, y) em coordenadas reais
+        def _rc_to_xy(r, c):
+            x, y = rasterio.transform.xy(skel_transform, r, c, offset="center")
+            return float(x), float(y)
+
+        # ── Função de suavização de Chaikin ──────────────────────────
+        def _chaikin(coords, iters=3):
+            for _ in range(iters):
+                if len(coords) < 3:
+                    break
+                nc = [coords[0]]
+                for j in range(len(coords) - 1):
+                    x0, y0 = coords[j];  x1, y1 = coords[j+1]
+                    nc.append((0.75*x0 + 0.25*x1, 0.75*y0 + 0.25*y1))
+                    nc.append((0.25*x0 + 0.75*x1, 0.25*y0 + 0.75*y1))
+                nc.append(coords[-1])
+                coords = nc
+            return coords
+
+        # ── Rastreio: percorrer cada cadeia de pixels ───────────────────
+        # Estratégia:
+        #   • Marcar pixels visitados num array separado.
+        #   • Para cada pixel de arranque (terminal ou junção), percorrer
+        #     os vizinhos não visitados até atingir outro terminal/junção
+        #     ou um pixel sem saída.
+        #   • Cada cadeia completa → uma LineString.
+
+        visited  = np.zeros_like(skel_arr, dtype=bool)
+        lines_rc = []   # lista de listas de (row, col)
+
+        # Offsets dos 8 vizinhos (Moore neighbourhood)
+        NEIGHBORS_8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+
+        def _get_active_neighbors(r, c):
+            nb = []
+            for dr, dc in NEIGHBORS_8:
+                nr, nc_ = r+dr, c+dc
+                if 0 <= nr < skel_arr.shape[0] and 0 <= nc_ < skel_arr.shape[1]:
+                    if skel_arr[nr, nc_] and not visited[nr, nc_]:
+                        nb.append((nr, nc_))
+            return nb
+
+        # Pontos de arranque: terminais primeiro, depois junções
+        start_mask = terminals | junctions
+        start_rows, start_cols = np.where(start_mask)
+
+        # Se não há terminais/junções (linha circular fechada), usar qualquer pixel
+        if len(start_rows) == 0:
+            start_rows, start_cols = np.where(skel_arr)
+
+        total_starts = len(start_rows)
+        for si, (sr, sc) in enumerate(zip(start_rows, start_cols)):
+            if visited[sr, sc]:
+                continue
+
+            # Percorrer cada ramo saindo deste ponto de arranque
+            neighbors = _get_active_neighbors(sr, sc)
+            if not neighbors and not visited[sr, sc]:
+                # Pixel isolado (já podado mas ficou) — ignorar
+                visited[sr, sc] = True
+                continue
+
+            visited[sr, sc] = True
+
+            for (nr, nc_) in neighbors:
+                if visited[nr, nc_]:
+                    continue
+                # Seguir a cadeia
+                chain = [(sr, sc), (nr, nc_)]
+                visited[nr, nc_] = True
+                cur_r, cur_c = nr, nc_
+
+                while True:
+                    nbs = _get_active_neighbors(cur_r, cur_c)
+                    if not nbs:
+                        break
+                    # Se há múltiplos vizinhos não visitados: parar (chegou a junção)
+                    if len(nbs) > 1:
+                        # Marcar como ponto de chegada mas não marcar como visitado
+                        # (outras cadeias arrancarão daqui)
+                        chain.append(nbs[0])
+                        break
+                    next_r, next_c = nbs[0]
+                    chain.append((next_r, next_c))
+                    visited[next_r, next_c] = True
+                    cur_r, cur_c = next_r, next_c
+                    # Parar se chegou a terminal ou junção
+                    if terminals[cur_r, cur_c] or junctions[cur_r, cur_c]:
+                        break
+
+                if len(chain) >= 2:
+                    lines_rc.append(chain)
+
+            if si % 5000 == 0:
+                feedback.setProgress(53 + int(si / max(total_starts, 1) * 5))
+                if feedback.isCanceled():
+                    return {}
+
+        del skel_arr, visited, terminals, internals, junctions, n_neighbors
+        gc.collect()
+        feedback.pushInfo(self.tr(f"Rastreio concluido: {len(lines_rc)} cadeias encontradas."))
+        feedback.setProgress(58)
+
+        # ── Converter cadeias (row,col) → LineStrings e gravar ─────────
         temp_central_path = os.path.join(tmp, "temp_central.gpkg")
 
-        # ── Definir SRS via WKT do QGIS — NÃO usa proj.db ────────────
-        # ImportFromEPSG() consulta o proj.db e falha quando há múltiplas
-        # instalações do PROJ no sistema (OSGeo4W + Anaconda, etc.).
-        # ImportFromWkt() lê a definição da string — sem aceder ao proj.db.
-        # O QGIS já tem o WKT correcto em work_crs_qgs.toWkt().
         srs = osr.SpatialReference()
         srs_ok = False
         try:
-            wkt_str = work_crs_qgs.toWkt()
-            ret = srs.ImportFromWkt(wkt_str)
+            ret = srs.ImportFromWkt(work_crs_qgs.toWkt())
             srs_ok = (ret == 0)
         except Exception:
             pass
         if not srs_ok:
-            feedback.pushWarning(self.tr(
-                "Nao foi possivel definir o SRS para o ficheiro central. "
-                "O ficheiro sera gravado sem SRC definido."
-            ))
             srs = None
 
-        # ── Criar datasource GPKG e layer ──────────────────────────────
         drv     = ogr.GetDriverByName("GPKG")
         ds_cent = drv.CreateDataSource(temp_central_path)
-        lyr     = ds_cent.CreateLayer(
-            "central_routes",
-            srs=srs,
-            geom_type=ogr.wkbLineString,
-        )
-        field_def = ogr.FieldDefn("source", ogr.OFTString)
-        field_def.SetWidth(32)
-        lyr.CreateField(field_def)
+        lyr     = ds_cent.CreateLayer("central_routes", srs=srs, geom_type=ogr.wkbLineString)
+        fdef    = ogr.FieldDefn("source", ogr.OFTString); fdef.SetWidth(32)
+        lyr.CreateField(fdef)
         lyr_defn = lyr.GetLayerDefn()
 
-        # ── Ler esqueleto em blocos e gravar feature a feature ─────────
-        with rasterio.open(temp_skel_path) as src:
-            skel_transform = src.transform
-            skel_height    = src.height
-            skel_width     = src.width
-            pixel_size     = abs(skel_transform.a)
-
-        simplify_tol   = pixel_size * 1.0
-        rows_per_block = max(1, min(skel_height, (32 * 1024 * 1024) // max(skel_width, 1)))
-        n_blocks       = math.ceil(skel_height / rows_per_block)
-        BATCH_SIZE     = 20_000
-        feat_count     = 0
-
+        # Tolerância de simplify = 1.5 pixels (colapsa degraus da grade)
+        simplify_tol = pixel_size * 1.5
+        feat_count   = 0
+        BATCH_SIZE   = 20_000
         lyr.StartTransaction()
 
-        with rasterio.open(temp_skel_path) as src:
-            for i, row_off in enumerate(range(0, skel_height, rows_per_block)):
-                actual_rows     = min(rows_per_block, skel_height - row_off)
-                window          = rasterio.windows.Window(0, row_off, skel_width, actual_rows)
-                block           = src.read(1, window=window)
+        for ci, chain in enumerate(lines_rc):
+            # Converter (row,col) → coordenadas reais
+            coords = [_rc_to_xy(r, c) for r, c in chain]
+            if len(coords) < 2:
+                continue
 
-                if block.max() == 0:
-                    del block
-                    continue
+            # Simplify — colapsa degraus de pixel
+            line = ShpLineString(coords).simplify(simplify_tol, preserve_topology=False)
+            if line.is_empty or line.length == 0:
+                continue
 
-                block_transform = rasterio.windows.transform(window, skel_transform)
+            # Chaikin — suaviza cotovelos residuais
+            smooth_coords = _chaikin(list(line.coords), iters=3)
+            if len(smooth_coords) < 2:
+                continue
 
-                for geom_dict, val in rasterio_shapes(block, transform=block_transform):
-                    if val == 0:
-                        continue
-                    geom = shapely_shape(geom_dict)
+            smooth_line = ShpLineString(smooth_coords)
+            if smooth_line.is_empty or smooth_line.length == 0:
+                continue
 
-                    # Passo 1: simplify — remove vértices redundantes dos degraus de pixel
-                    # Tolerância = 1.5× o tamanho do pixel para colapsar degraus
-                    line = geom.boundary.simplify(simplify_tol * 1.5, preserve_topology=False)
-                    if line.is_empty:
-                        continue
+            ogr_geom = ogr.CreateGeometryFromWkt(smooth_line.wkt)
+            if ogr_geom is None:
+                continue
 
-                    # Passo 2: suavização de Chaikin — arredonda os "cotovelos" que
-                    # sobram depois do simplify. Aplica 3 iterações do algoritmo de
-                    # subdivisão de Chaikin: cada segmento é substituído por dois
-                    # pontos a 1/4 e 3/4 do segmento original, produzindo uma curva
-                    # suave que passa próximo dos pontos originais.
-                    # Apenas aplicado a linhas com >= 3 vértices.
-                    parts = (
-                        list(line.geoms)
-                        if line.geom_type == "MultiLineString"
-                        else [line]
-                    )
-                    for part in parts:
-                        if part.is_empty or part.length == 0:
-                            continue
-                        coords = list(part.coords)
-                        # Chaikin: 3 iterações
-                        for _ in range(3):
-                            if len(coords) < 3:
-                                break
-                            new_coords = [coords[0]]
-                            for j in range(len(coords) - 1):
-                                x0, y0 = coords[j]
-                                x1, y1 = coords[j + 1]
-                                new_coords.append((0.75*x0 + 0.25*x1, 0.75*y0 + 0.25*y1))
-                                new_coords.append((0.25*x0 + 0.75*x1, 0.25*y0 + 0.75*y1))
-                            new_coords.append(coords[-1])
-                            coords = new_coords
-                        if len(coords) < 2:
-                            continue
-                        smooth_line = ShpLineString(coords)
-                        if smooth_line.is_empty or smooth_line.length == 0:
-                            continue
-                        ogr_geom = ogr.CreateGeometryFromWkt(smooth_line.wkt)
-                        if ogr_geom is None:
-                            continue
-                        feat = ogr.Feature(lyr_defn)
-                        feat.SetGeometry(ogr_geom)
-                        feat.SetField("source", "central")
-                        lyr.CreateFeature(feat)
-                        feat  = None
-                        feat_count += 1
+            feat = ogr.Feature(lyr_defn)
+            feat.SetGeometry(ogr_geom)
+            feat.SetField("source", "central")
+            lyr.CreateFeature(feat)
+            feat = None
+            feat_count += 1
 
-                    if feat_count % BATCH_SIZE == 0:
-                        lyr.CommitTransaction()
-                        lyr.StartTransaction()
-                        gc.collect()
-
-                del block
+            if feat_count % BATCH_SIZE == 0:
+                lyr.CommitTransaction()
+                lyr.StartTransaction()
                 gc.collect()
-                feedback.setProgress(50 + int((i + 1) / n_blocks * 8))
-                if feedback.isCanceled():
-                    lyr.CommitTransaction()
-                    ds_cent = None
-                    return {}
 
         lyr.CommitTransaction()
-        ds_cent = None   # fecha e grava o ficheiro
+        ds_cent = None
+        del lines_rc
         gc.collect()
         feedback.pushInfo(self.tr(f"Vectorizacao concluida: {feat_count} segmentos gravados."))
         feedback.setProgress(58)
