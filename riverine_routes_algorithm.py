@@ -13,13 +13,18 @@ from qgis.core import (
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterNumber,
     QgsProcessingParameterCrs,
+    QgsProcessingParameterRasterDestination,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsProject,
     QgsFeatureSink,
     QgsVectorLayer,
     QgsFeature,
+    QgsFields,
+    QgsField,
+    QgsWkbTypes,
 )
+from qgis.PyQt.QtCore import QVariant
 
 import geopandas as gpd
 import numpy as np
@@ -194,14 +199,16 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
     para um sistema UTM métrico antes do processamento.
     """
 
-    INPUT_RASTER     = "INPUT_RASTER"
-    INPUT_VECTOR     = "INPUT_VECTOR"
-    INPUT_LIMITS     = "INPUT_LIMITS"
-    INPUT_GPS_TRACKS = "INPUT_GPS_TRACKS"
-    BUFFER_DIST      = "BUFFER_DIST"
+    INPUT_RASTER      = "INPUT_RASTER"
+    INPUT_VECTOR      = "INPUT_VECTOR"
+    INPUT_LIMITS      = "INPUT_LIMITS"
+    INPUT_GPS_TRACKS  = "INPUT_GPS_TRACKS"
+    BUFFER_DIST       = "BUFFER_DIST"
     TRANSECT_INTERVAL = "TRANSECT_INTERVAL"
-    OUTPUT_CRS       = "OUTPUT_CRS"
-    OUTPUT_NETWORK   = "OUTPUT_NETWORK"
+    OUTPUT_CRS        = "OUTPUT_CRS"
+    OUTPUT_SKELETON   = "OUTPUT_SKELETON"    # raster esqueleto para inspeção
+    OUTPUT_CENTRAL    = "OUTPUT_CENTRAL"     # polylines centrais (antes da rede completa)
+    OUTPUT_NETWORK    = "OUTPUT_NETWORK"
 
     # ------------------------------------------------------------------
     def tr(self, string):
@@ -310,7 +317,27 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # OUTPUT: Rede final de linhas
+        # OUTPUT A: Raster do esqueleto (inspeção visual)
+        self.addParameter(
+            QgsProcessingParameterRasterDestination(
+                self.OUTPUT_SKELETON,
+                self.tr("Raster do Esqueleto (inspeção)"),
+                optional=True,
+                createByDefault=False,
+            )
+        )
+
+        # OUTPUT B: Polylines centrais (antes de marginais/transversais)
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_CENTRAL,
+                self.tr("Rotas Centrais (Polylines)"),
+                optional=True,
+                createByDefault=False,
+            )
+        )
+
+        # OUTPUT C: Rede final de linhas
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT_NETWORK,
@@ -834,6 +861,18 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         except OSError:
             pass
 
+        # ── OUTPUT_SKELETON: exportar raster do esqueleto se pedido ────
+        skel_dest = parameters.get(self.OUTPUT_SKELETON)
+        if skel_dest:
+            feedback.pushInfo(self.tr("A exportar raster do esqueleto para inspeção..."))
+            import shutil
+            try:
+                skel_out_path = self.parameterAsOutputLayer(parameters, self.OUTPUT_SKELETON, context)
+                shutil.copy2(temp_skel_path, skel_out_path)
+                feedback.pushInfo(self.tr(f"Raster do esqueleto gravado em: {skel_out_path}"))
+            except Exception as e_skel:
+                feedback.pushWarning(self.tr(f"Nao foi possivel exportar o raster do esqueleto: {e_skel}"))
+
         feedback.pushInfo(self.tr("Esqueleto gravado. A vectorizar via rastreio de grafo de pixels..."))
 
         # ── VECTORIZAÇÃO DO ESQUELETO — RASTREIO DE GRAFO ──────────────
@@ -1136,29 +1175,144 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         lyr.CommitTransaction()
         ds_cent = None
-        del merged_lines
         gc.collect()
-        feedback.pushInfo(self.tr(f"Vectorizacao concluida: {feat_count} segmentos gravados."))
+        feedback.pushInfo(self.tr(f"Vectorizacao concluida: {feat_count} polylines gravadas."))
         feedback.setProgress(58)
 
-        # Dissolver linhas contíguas (reduz número de features e melhora topologia)
-        feedback.pushInfo(self.tr("A dissolver e simplificar rotas centrais..."))
-        central_routes = processing.run(
-            "native:dissolve",
-            {
-                "INPUT":  temp_central_path,
-                "FIELD":  [],
-                "OUTPUT": "TEMPORARY_OUTPUT",
-            },
-            context=context,
-            feedback=feedback,
-        )["OUTPUT"]
+        # ── UNIÃO DE EXTREMIDADES PRÓXIMAS DENTRO DO POLÍGONO DE ÁGUA ──
+        #
+        # Após o linemerge, podem restar linhas cujas extremidades estão
+        # próximas mas não se tocam (gaps de 1-2 pixels na esqueletonização,
+        # ou canais ligeiramente separados).
+        # Para cada par de extremidades (endpoint) que:
+        #   1. Distam menos que JOIN_DIST metros entre si, E
+        #   2. A linha recta entre elas está DENTRO do polígono de água
+        # → cria-se uma nova LineString de ligação.
+        # A condição 2 garante que a união nunca passa por terra.
+        # ---------------------------------------------------------------
+        feedback.pushInfo(self.tr("A unir extremidades proximas dentro da mascara de agua..."))
 
-        try:
-            os.remove(temp_central_path)
-        except OSError:
-            pass
+        from shapely.geometry import LineString as ShpLineString, Point as ShpPoint
+        from shapely.ops      import linemerge as shp_linemerge
+
+        # Carregar polígono de água para validação da união
+        water_gdf_join = _read_vector(vector_path)[["geometry"]]
+        water_union_join = water_gdf_join.geometry.unary_union
+        del water_gdf_join
         gc.collect()
+
+        # Distância máxima para união: 3× o tamanho do pixel
+        # (cobre gaps que sobram após pruning/thin)
+        JOIN_DIST = pixel_size * 3.0
+
+        # Ler todas as linhas do gpkg gerado
+        from osgeo import ogr as _ogr2
+        ds_read = _ogr2.Open(temp_central_path)
+        lyr_read = ds_read.GetLayer(0)
+        central_shapely = []
+        for feat_r in lyr_read:
+            wkt = feat_r.GetGeometryRef().ExportToWkt()
+            try:
+                from shapely.geometry import shape as shp_shape
+                from shapely import wkt as shp_wkt
+                geom = shp_wkt.loads(wkt)
+                if geom and not geom.is_empty:
+                    central_shapely.append(geom)
+            except Exception:
+                pass
+        ds_read = None
+        gc.collect()
+
+        # Recolher todos os endpoints (primeiro e último ponto de cada linha)
+        endpoints = []   # lista de (ShpPoint, line_idx, 'start'|'end')
+        for li, line in enumerate(central_shapely):
+            coords = list(line.coords)
+            if len(coords) >= 2:
+                endpoints.append((ShpPoint(coords[0]),  li, "start"))
+                endpoints.append((ShpPoint(coords[-1]), li, "end"))
+
+        # Encontrar pares de endpoints próximos de linhas DIFERENTES
+        connector_lines = []
+        used_pairs = set()
+        for i, (pa, la, _) in enumerate(endpoints):
+            for j, (pb, lb, _) in enumerate(endpoints):
+                if la == lb:
+                    continue   # mesmo line — não conectar consigo próprio
+                pair_key = (min(la, lb), max(la, lb))
+                if pair_key in used_pairs:
+                    continue
+                dist = pa.distance(pb)
+                if dist < 1e-6 or dist > JOIN_DIST:
+                    continue
+                # Verificar se a linha recta entre os pontos está dentro da água
+                connector = ShpLineString([pa.coords[0], pb.coords[0]])
+                if water_union_join.contains(connector):
+                    connector_lines.append(connector)
+                    used_pairs.add(pair_key)
+
+        if connector_lines:
+            feedback.pushInfo(self.tr(f"  {len(connector_lines)} ligacoes criadas dentro da mascara de agua."))
+            # Adicionar conectores ao gpkg existente
+            ds_conn = _ogr2.Open(temp_central_path, 1)  # 1 = update
+            lyr_conn = ds_conn.GetLayer(0)
+            lyr_conn.StartTransaction()
+            lyr_defn_conn = lyr_conn.GetLayerDefn()
+            for conn_line in connector_lines:
+                og = _ogr2.CreateGeometryFromWkt(conn_line.wkt)
+                if og is None:
+                    continue
+                f = _ogr2.Feature(lyr_defn_conn)
+                f.SetGeometry(og)
+                f.SetField("source", "central_connector")
+                lyr_conn.CreateFeature(f)
+                f = None
+            lyr_conn.CommitTransaction()
+            ds_conn = None
+        else:
+            feedback.pushInfo(self.tr("  Nenhuma extremidade proxima encontrada para unir."))
+
+        del water_union_join, endpoints, connector_lines
+        gc.collect()
+        feedback.setProgress(60)
+
+        # ── ENTREGAR OUTPUT_CENTRAL (polylines individuais) ─────────────
+        # Usar o ficheiro gpkg directamente — cada feature é uma LineString
+        # individual (não MultiLineString). O OUTPUT_CENTRAL é opcional.
+        central_dest = parameters.get(self.OUTPUT_CENTRAL)
+        if central_dest:
+            feedback.pushInfo(self.tr("A exportar rotas centrais (polylines)..."))
+            from qgis.core import QgsFields, QgsField, QgsWkbTypes
+            central_fields = QgsFields()
+            central_fields.append(QgsField("source", QVariant.String))
+            (central_sink, central_dest_id) = self.parameterAsSink(
+                parameters, self.OUTPUT_CENTRAL, context,
+                central_fields, QgsWkbTypes.LineString, work_crs_qgs
+            )
+            if central_sink is not None:
+                ds_out = _ogr2.Open(temp_central_path)
+                lyr_out = ds_out.GetLayer(0)
+                for feat_out in lyr_out:
+                    wkt_out = feat_out.GetGeometryRef().ExportToWkt()
+                    try:
+                        from shapely import wkt as shp_wkt2
+                        g = shp_wkt2.loads(wkt_out)
+                        # Garantir que é LineString simples (explode MultiLineString)
+                        parts_out = list(g.geoms) if g.geom_type == "MultiLineString" else [g]
+                        for part_out in parts_out:
+                            if part_out.is_empty or part_out.length == 0:
+                                continue
+                            qfeat = QgsFeature(central_fields)
+                            from qgis.core import QgsGeometry
+                            qfeat.setGeometry(QgsGeometry.fromWkt(part_out.wkt))
+                            qfeat.setAttribute("source", feat_out.GetField("source") or "central")
+                            central_sink.addFeature(qfeat, QgsFeatureSink.FastInsert)
+                    except Exception:
+                        pass
+                ds_out = None
+                del central_sink
+
+        # central_routes = caminho do gpkg para uso nas etapas seguintes
+        central_routes = temp_central_path
         feedback.setProgress(62)
 
         # ── B. ROTAS MARGINAIS ──────────────────────────────────────────
