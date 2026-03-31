@@ -1089,42 +1089,74 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgress(58)
 
         # ── Converter cadeias (row,col) → LineStrings Shapely ──────────
-        # Fase 1: converter todas as cadeias para LineStrings reais,
-        #         aplicando simplify + Chaikin para suavização.
-        # Fase 2: linemerge para unir segmentos que se tocam nas pontas.
-        # Fase 3: deduplicação por distância média (Hausdorff aproximado)
-        #         para eliminar linhas paralelas remanescentes.
-        # Fase 4: gravar via OGR.
+        #
+        # PROBLEMA DO CHAIKIN: o algoritmo de Chaikin NÃO É interpolativo
+        # — a curva resultante não passa pelos pontos originais, apenas
+        # se aproxima. Em curvas de 90°+ com pixels de grade, o desvio
+        # pode ser de dezenas de pixels, gerando "linhas fantasma" em
+        # zonas sem esqueleto.
+        #
+        # SOLUÇÃO: usar apenas simplify (Ramer-Douglas-Peucker), que é
+        # interpolativo — a linha resultante está sempre dentro de
+        # simplify_tol dos pontos originais. Sem Chaikin.
+        #
+        # PROBLEMA DO DFS DESORDENADO: a segunda passagem usava DFS
+        # (pilha LIFO) que visita pixels em ordem aleatória, gerando
+        # cadeias com coordenadas embaralhadas. Uma LineString com coords
+        # fora de ordem é válida geometricamente mas visualmente errada
+        # (ziguezague). Solução: ordenar cada cadeia por proximidade
+        # (nearest-neighbour sort) antes de converter.
+        #
+        # Fases:
+        #   1. Ordenar coords de cada cadeia por proximidade ao vizinho
+        #   2. Converter para LineString + simplify (sem Chaikin)
+        #   3. linemerge para unir segmentos contíguos
+        #   4. deduplicação por distância média
 
         from shapely.ops import linemerge, unary_union as shp_unary_union
         from shapely.geometry import MultiLineString as ShpMultiLine
 
-        simplify_tol = pixel_size * 1.5
+        # Tolerância do simplify: 1 pixel. Mantém a fidelidade ao esqueleto.
+        simplify_tol = pixel_size * 1.0
         shapely_lines = []
 
-        feedback.pushInfo(self.tr("  Convertendo cadeias para LineStrings e suavizando..."))
+        feedback.pushInfo(self.tr("  Convertendo cadeias para LineStrings (sem Chaikin)..."))
         for chain in lines_rc:
-            coords = [_rc_to_xy(r, c) for r, c in chain]
+            if len(chain) < 2:
+                continue
+
+            # Ordenar pixels da cadeia por proximidade ao vizinho anterior
+            # (resolve o problema do DFS desordenado da segunda passagem)
+            ordered = [chain[0]]
+            remaining = list(chain[1:])
+            while remaining:
+                cr, cc = ordered[-1]
+                # Encontrar o pixel mais próximo (distância de Chebyshev)
+                best_i = 0
+                best_d = float("inf")
+                for idx, (nr, nc_) in enumerate(remaining):
+                    d = max(abs(nr - cr), abs(nc_ - cc))
+                    if d < best_d:
+                        best_d = d
+                        best_i = idx
+                ordered.append(remaining.pop(best_i))
+
+            coords = [_rc_to_xy(r, c) for r, c in ordered]
             if len(coords) < 2:
                 continue
-            line = ShpLineString(coords).simplify(simplify_tol, preserve_topology=False)
+
+            line = ShpLineString(coords).simplify(simplify_tol, preserve_topology=True)
             if line.is_empty or line.length == 0:
                 continue
-            smooth_coords = _chaikin(list(line.coords), iters=3)
-            if len(smooth_coords) < 2:
-                continue
-            sl = ShpLineString(smooth_coords)
-            if not sl.is_empty and sl.length > 0:
-                shapely_lines.append(sl)
+            # Não aplicar Chaikin — o simplify já é suficiente e é seguro
+            if not line.is_empty and line.length > 0:
+                shapely_lines.append(line)
 
         del lines_rc
         gc.collect()
         feedback.pushInfo(self.tr(f"  {len(shapely_lines)} segmentos antes do merge."))
 
         # ── LINEMERGE: unir segmentos que se tocam nas extremidades ─────
-        # Elimina a fragmentação — segmentos contíguos tornam-se uma linha
-        # única contínua, o que melhora drasticamente a qualidade das
-        # transversais (interpolate opera sobre o comprimento total).
         feedback.pushInfo(self.tr("  Unindo segmentos contiguos (linemerge)..."))
         merged = linemerge(shapely_lines)
         del shapely_lines
@@ -1135,7 +1167,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         elif merged.geom_type == "MultiLineString":
             merged_lines = list(merged.geoms)
         else:
-            # GeometryCollection — extrair apenas LineStrings
             merged_lines = [g for g in merged.geoms if g.geom_type == "LineString"]
 
         feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos linemerge."))
