@@ -642,32 +642,136 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         except OSError:
             pass
 
-        feedback.pushInfo(self.tr("Esqueleto gravado. A converter para vectorial..."))
+        feedback.pushInfo(self.tr("Esqueleto gravado. A vectorizar via rasterio.features (streaming)..."))
 
-        central_lines = processing.run(
-            "native:pixelstopolygons",
+        # ── VECTORIZAÇÃO DO ESQUELETO ───────────────────────────────────
+        #
+        # PROBLEMA com native:pixelstopolygons:
+        #   Gera um polígono por pixel — para um raster de 500 MB pode
+        #   produzir dezenas de milhões de polígonos em memória RAM de
+        #   uma só vez, travando o sistema.
+        #
+        # SOLUÇÃO — rasterio.features.shapes() em streaming:
+        #   • Lê o raster em blocos de linhas (~32 MB por bloco).
+        #   • O gerador shapes() emite geometrias uma a uma — nunca
+        #     guarda todas na RAM simultaneamente.
+        #   • Apenas os pixels com valor > 0 (esqueleto) geram geometrias.
+        #   • As geometrias são acumuladas numa lista leve de dicts e
+        #     gravadas em disco via Fiona em modo append, batch a batch.
+        #   • Depois de gravar, a lista é limpa e a RAM libertada.
+        #   • simplify() com tolerância = 1 pixel remove vértices
+        #     redundantes dos quadrados de pixels antes de gravar,
+        #     reduzindo drasticamente o tamanho do ficheiro de saída.
+        # ---------------------------------------------------------------
+        import fiona
+        import fiona.crs
+        from rasterio.features import shapes as rasterio_shapes
+        from shapely.geometry import shape as shapely_shape, mapping
+
+        temp_central_path = os.path.join(tmp, "temp_central.gpkg")
+
+        with rasterio.open(temp_skel_path) as src:
+            skel_transform = src.transform
+            skel_crs       = src.crs
+            skel_height    = src.height
+            skel_width     = src.width
+            pixel_size     = abs(skel_transform.a)   # tamanho do pixel em unidades do SRC
+
+            # Tolerância de simplificação: 1 pixel (remove artefactos de grade)
+            simplify_tol = pixel_size * 1.0
+
+            # Linhas por bloco: ~32 MB de RAM por leitura
+            rows_per_block = max(1, min(skel_height, (32 * 1024 * 1024) // max(skel_width, 1)))
+            n_blocks = math.ceil(skel_height / rows_per_block)
+
+            # Schema Fiona: apenas a geometria (LineString/MultiLineString)
+            schema = {
+                "geometry": "LineString",
+                "properties": {"source": "str"},
+            }
+            fiona_crs = fiona.crs.from_epsg(work_epsg) if work_epsg else {}
+
+            # Gravar em streaming — abrir ficheiro uma vez, escrever batch a batch
+            BATCH_SIZE = 50_000   # features por flush para disco
+            batch = []
+
+            with fiona.open(
+                temp_central_path, "w",
+                driver="GPKG",
+                crs=fiona_crs,
+                schema=schema,
+            ) as dst_fiona:
+
+                for i, row_off in enumerate(range(0, skel_height, rows_per_block)):
+                    actual_rows = min(rows_per_block, skel_height - row_off)
+                    window      = rasterio.windows.Window(0, row_off, skel_width, actual_rows)
+                    block       = src.read(1, window=window)
+
+                    if block.max() == 0:
+                        # Bloco vazio — saltar sem processar
+                        del block
+                        continue
+
+                    # Calcular o transform do bloco (offset Y correcto)
+                    block_transform = rasterio.windows.transform(window, skel_transform)
+
+                    # Gerar geometrias via gerador (streaming — sem lista intermédia)
+                    for geom_dict, val in rasterio_shapes(block, transform=block_transform):
+                        if val == 0:
+                            continue
+                        geom = shapely_shape(geom_dict)
+                        # Converter polígono de pixel → linha de contorno e simplificar
+                        line = geom.boundary.simplify(simplify_tol, preserve_topology=False)
+                        if line.is_empty:
+                            continue
+                        # Explodir MultiLineString em LineStrings individuais
+                        parts = list(line.geoms) if line.geom_type == "MultiLineString" else [line]
+                        for part in parts:
+                            if not part.is_empty and part.length > 0:
+                                batch.append({
+                                    "geometry": mapping(part),
+                                    "properties": {"source": "central"},
+                                })
+                        # Flush para disco quando o batch atinge o limite
+                        if len(batch) >= BATCH_SIZE:
+                            dst_fiona.writerecords(batch)
+                            batch.clear()
+                            gc.collect()
+
+                    del block
+                    gc.collect()
+                    feedback.setProgress(50 + int((i + 1) / n_blocks * 8))  # 50-58%
+                    if feedback.isCanceled():
+                        return {}
+
+                # Flush final
+                if batch:
+                    dst_fiona.writerecords(batch)
+                    batch.clear()
+
+        del batch
+        gc.collect()
+        feedback.setProgress(58)
+
+        # Dissolver linhas contíguas (reduz número de features e melhora topologia)
+        feedback.pushInfo(self.tr("A dissolver e simplificar rotas centrais..."))
+        central_routes = processing.run(
+            "native:dissolve",
             {
-                "INPUT_RASTER": temp_skel_path,
-                "RASTER_BAND":  1,
-                "FIELD_NAME":   "is_water",
-                "OUTPUT":       "TEMPORARY_OUTPUT",
+                "INPUT":  temp_central_path,
+                "FIELD":  [],
+                "OUTPUT": "TEMPORARY_OUTPUT",
             },
             context=context,
             feedback=feedback,
         )["OUTPUT"]
-        feedback.setProgress(50)
 
-        central_routes = processing.run(
-            "native:polygonstolines",
-            {"INPUT": central_lines, "OUTPUT": "TEMPORARY_OUTPUT"},
-            context=context,
-            feedback=feedback,
-        )["OUTPUT"]
-
-        # Libertar a camada de polígonos intermédios
-        del central_lines
+        try:
+            os.remove(temp_central_path)
+        except OSError:
+            pass
         gc.collect()
-        feedback.setProgress(55)
+        feedback.setProgress(62)
 
         # ── B. ROTAS MARGINAIS ──────────────────────────────────────────
         # Otimização: processar feature a feature em vez de carregar tudo
