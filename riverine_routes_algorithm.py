@@ -686,121 +686,100 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         except OSError:
             pass
 
-        feedback.pushInfo(self.tr("Esqueleto gravado. A vectorizar via rasterio.features (streaming)..."))
+        feedback.pushInfo(self.tr("Esqueleto gravado. A vectorizar via rasterio.features + geopandas (streaming)..."))
 
         # ── VECTORIZAÇÃO DO ESQUELETO ───────────────────────────────────
         #
-        # PROBLEMA com native:pixelstopolygons:
-        #   Gera um polígono por pixel — para um raster de 500 MB pode
-        #   produzir dezenas de milhões de polígonos em memória RAM de
-        #   uma só vez, travando o sistema.
+        # USA rasterio.features.shapes() + GeoPandas — SEM Fiona directamente.
+        # O Fiona instalado fora do OSGeo4W pode ter conflito de proj.db,
+        # causando "PROJ: proj_create_from_database: DATABASE.LAYOUT.VERSION".
+        # O GeoPandas usa o GDAL/PROJ do OSGeo4W internamente (via pyogrio),
+        # pelo que não sofre deste conflito.
         #
-        # SOLUÇÃO — rasterio.features.shapes() em streaming:
-        #   • Lê o raster em blocos de linhas (~32 MB por bloco).
-        #   • O gerador shapes() emite geometrias uma a uma — nunca
-        #     guarda todas na RAM simultaneamente.
-        #   • Apenas os pixels com valor > 0 (esqueleto) geram geometrias.
-        #   • As geometrias são acumuladas numa lista leve de dicts e
-        #     gravadas em disco via Fiona em modo append, batch a batch.
-        #   • Depois de gravar, a lista é limpa e a RAM libertada.
-        #   • simplify() com tolerância = 1 pixel remove vértices
-        #     redundantes dos quadrados de pixels antes de gravar,
-        #     reduzindo drasticamente o tamanho do ficheiro de saída.
+        # Estratégia de memória:
+        #   • Ler o esqueleto em blocos de ~32 MB de linhas.
+        #   • rasterio_shapes() emite geometrias uma a uma (gerador).
+        #   • Acumular num batch de LineStrings simplificadas.
+        #   • A cada BATCH_SIZE features: criar um GeoDataFrame e fazer
+        #     append ao ficheiro .gpkg via to_file(mode="a").
+        #   • Libertar o batch e forçar gc antes do próximo bloco.
         # ---------------------------------------------------------------
-        import fiona
-        import fiona.crs
         from rasterio.features import shapes as rasterio_shapes
-        from shapely.geometry import shape as shapely_shape, mapping
+        from shapely.geometry import shape as shapely_shape
 
         temp_central_path = os.path.join(tmp, "temp_central.gpkg")
+        first_batch = True   # controla se o gpkg é criado ou feito append
 
         with rasterio.open(temp_skel_path) as src:
             skel_transform = src.transform
             skel_crs       = src.crs
             skel_height    = src.height
             skel_width     = src.width
-            pixel_size     = abs(skel_transform.a)   # tamanho do pixel em unidades do SRC
+            pixel_size     = abs(skel_transform.a)
 
-            # Tolerância de simplificação: 1 pixel (remove artefactos de grade)
-            simplify_tol = pixel_size * 1.0
+            simplify_tol   = pixel_size * 1.0   # 1 pixel de tolerância
 
-            # Linhas por bloco: ~32 MB de RAM por leitura
             rows_per_block = max(1, min(skel_height, (32 * 1024 * 1024) // max(skel_width, 1)))
-            n_blocks = math.ceil(skel_height / rows_per_block)
+            n_blocks       = math.ceil(skel_height / rows_per_block)
 
-            # Schema Fiona: apenas a geometria (LineString/MultiLineString)
-            schema = {
-                "geometry": "LineString",
-                "properties": {"source": "str"},
-            }
-            # CRS para o Fiona: preferir EPSG numérico, fallback para WKT do QGIS
-            if work_epsg:
-                fiona_crs = fiona.crs.from_epsg(work_epsg)
-            else:
-                try:
-                    fiona_crs = fiona.crs.from_wkt(work_crs_qgs.toWkt())
-                except Exception:
-                    fiona_crs = {}
+            BATCH_SIZE = 20_000   # features por flush (conservador para não encher RAM)
+            geom_batch = []
 
-            # Gravar em streaming — abrir ficheiro uma vez, escrever batch a batch
-            BATCH_SIZE = 50_000   # features por flush para disco
-            batch = []
+            def _flush_batch(geom_list, path, crs_epsg, is_first):
+                """Grava uma lista de geometrias Shapely num .gpkg via GeoPandas."""
+                if not geom_list:
+                    return is_first
+                gdf = gpd.GeoDataFrame(
+                    {"source": ["central"] * len(geom_list)},
+                    geometry=geom_list,
+                    crs=f"EPSG:{crs_epsg}" if crs_epsg else None,
+                )
+                mode   = "w" if is_first else "a"
+                layer  = "central_routes"
+                gdf.to_file(path, driver="GPKG", layer=layer, mode=mode)
+                del gdf
+                gc.collect()
+                return False   # já não é o primeiro batch
 
-            with fiona.open(
-                temp_central_path, "w",
-                driver="GPKG",
-                crs=fiona_crs,
-                schema=schema,
-            ) as dst_fiona:
+            for i, row_off in enumerate(range(0, skel_height, rows_per_block)):
+                actual_rows     = min(rows_per_block, skel_height - row_off)
+                window          = rasterio.windows.Window(0, row_off, skel_width, actual_rows)
+                block           = src.read(1, window=window)
 
-                for i, row_off in enumerate(range(0, skel_height, rows_per_block)):
-                    actual_rows = min(rows_per_block, skel_height - row_off)
-                    window      = rasterio.windows.Window(0, row_off, skel_width, actual_rows)
-                    block       = src.read(1, window=window)
-
-                    if block.max() == 0:
-                        # Bloco vazio — saltar sem processar
-                        del block
-                        continue
-
-                    # Calcular o transform do bloco (offset Y correcto)
-                    block_transform = rasterio.windows.transform(window, skel_transform)
-
-                    # Gerar geometrias via gerador (streaming — sem lista intermédia)
-                    for geom_dict, val in rasterio_shapes(block, transform=block_transform):
-                        if val == 0:
-                            continue
-                        geom = shapely_shape(geom_dict)
-                        # Converter polígono de pixel → linha de contorno e simplificar
-                        line = geom.boundary.simplify(simplify_tol, preserve_topology=False)
-                        if line.is_empty:
-                            continue
-                        # Explodir MultiLineString em LineStrings individuais
-                        parts = list(line.geoms) if line.geom_type == "MultiLineString" else [line]
-                        for part in parts:
-                            if not part.is_empty and part.length > 0:
-                                batch.append({
-                                    "geometry": mapping(part),
-                                    "properties": {"source": "central"},
-                                })
-                        # Flush para disco quando o batch atinge o limite
-                        if len(batch) >= BATCH_SIZE:
-                            dst_fiona.writerecords(batch)
-                            batch.clear()
-                            gc.collect()
-
+                if block.max() == 0:
                     del block
-                    gc.collect()
-                    feedback.setProgress(50 + int((i + 1) / n_blocks * 8))  # 50-58%
-                    if feedback.isCanceled():
-                        return {}
+                    continue
 
-                # Flush final
-                if batch:
-                    dst_fiona.writerecords(batch)
-                    batch.clear()
+                block_transform = rasterio.windows.transform(window, skel_transform)
 
-        del batch
+                for geom_dict, val in rasterio_shapes(block, transform=block_transform):
+                    if val == 0:
+                        continue
+                    geom = shapely_shape(geom_dict)
+                    line = geom.boundary.simplify(simplify_tol, preserve_topology=False)
+                    if line.is_empty:
+                        continue
+                    parts = list(line.geoms) if line.geom_type == "MultiLineString" else [line]
+                    for part in parts:
+                        if not part.is_empty and part.length > 0:
+                            geom_batch.append(part)
+
+                    if len(geom_batch) >= BATCH_SIZE:
+                        first_batch = _flush_batch(geom_batch, temp_central_path, work_epsg, first_batch)
+                        geom_batch.clear()
+                        gc.collect()
+
+                del block
+                gc.collect()
+                feedback.setProgress(50 + int((i + 1) / n_blocks * 8))  # 50-58%
+                if feedback.isCanceled():
+                    return {}
+
+            # Flush final
+            first_batch = _flush_batch(geom_batch, temp_central_path, work_epsg, first_batch)
+            geom_batch.clear()
+
+        del geom_batch
         gc.collect()
         feedback.setProgress(58)
 
