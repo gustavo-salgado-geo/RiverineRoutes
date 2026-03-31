@@ -417,24 +417,52 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         work_epsg = None
 
         if raster_crs_wkt is not None and not raster_is_geo:
-            # Caso 1: raster já métrico
+            # Caso 1: raster já métrico.
+            # Fonte primária: authid do QgsCoordinateReferenceSystem (ex: "EPSG:32722").
+            # O pyproj é usado apenas se o authid não tiver prefixo EPSG.
+            work_epsg = None
+
+            # Tentativa 1: authid do QGIS (mais fiável — é o que o QGIS mostra ao utilizador)
             try:
-                proj_crs = ProjCRS.from_wkt(raster_crs_wkt)
-                auth     = proj_crs.to_authority()
-                work_epsg = int(auth[1]) if auth else None
+                auth_id = qgs_raster_crs.authid()   # ex: "EPSG:32722"
+                if auth_id.upper().startswith("EPSG:"):
+                    work_epsg = int(auth_id.split(":")[1])
             except Exception:
-                # Se não conseguir extrair EPSG numérico, tenta pelo authid do QGIS
+                pass
+
+            # Tentativa 2: pyproj (fallback para SRCs não-EPSG)
+            if work_epsg is None:
                 try:
-                    auth_id = qgs_raster_crs.authid()
-                    if auth_id.upper().startswith("EPSG:"):
-                        work_epsg = int(auth_id.split(":")[1])
+                    proj_crs = ProjCRS.from_wkt(raster_crs_wkt)
+                    auth     = proj_crs.to_authority()
+                    if auth:
+                        work_epsg = int(auth[1])
                 except Exception:
-                    work_epsg = None
-            feedback.pushInfo(
-                self.tr(
-                    f"SRC de trabalho: EPSG:{work_epsg} (raster métrico, sem reprojeção)."
+                    pass
+
+            # Tentativa 3: postgisSrid do QGIS (último recurso)
+            if work_epsg is None:
+                try:
+                    srid = qgs_raster_crs.postgisSrid()
+                    if srid and srid > 0:
+                        work_epsg = srid
+                except Exception:
+                    pass
+
+            if work_epsg:
+                feedback.pushInfo(
+                    self.tr(f"SRC de trabalho: EPSG:{work_epsg} (raster métrico, sem reprojeção).")
                 )
-            )
+            else:
+                # Nao conseguiu extrair EPSG numérico — usar o objecto QGIS directamente
+                # (work_crs_qgs será definido abaixo a partir de qgs_raster_crs)
+                feedback.pushWarning(
+                    self.tr(
+                        f"Nao foi possivel extrair o codigo EPSG numerico do SRC do raster "
+                        f"({qgs_raster_crs.authid()}). O SRC QGIS sera usado directamente. "
+                        f"Verifique os resultados."
+                    )
+                )
             raster_path = raster_path_orig
 
         elif raster_crs_wkt is not None and raster_is_geo:
@@ -520,10 +548,26 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         )
 
         # SRC QGIS de trabalho (usado no merge e na saída)
-        work_crs_qgs = (
-            QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
-            if work_epsg
-            else context.project().crs()
+        # Prioridade: (1) EPSG numérico extraído → constrói por código
+        #             (2) QgsRasterLayer.crs() → já é um objecto válido
+        #             (3) CRS do projecto QGIS → último recurso
+        if work_epsg:
+            work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
+        elif qgs_raster_crs.isValid():
+            work_crs_qgs = qgs_raster_crs
+            # Tentar recuperar o EPSG a partir do objecto QGIS como inteiro
+            try:
+                srid = qgs_raster_crs.postgisSrid()
+                if srid and srid > 0:
+                    work_epsg = srid
+                    work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
+            except Exception:
+                pass
+        else:
+            work_crs_qgs = context.project().crs()
+
+        feedback.pushInfo(
+            self.tr(f"SRC QGIS de trabalho definido: {work_crs_qgs.authid()}")
         )
 
         # ── A. ROTAS CENTRAIS ───────────────────────────────────────────
@@ -689,7 +733,14 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 "geometry": "LineString",
                 "properties": {"source": "str"},
             }
-            fiona_crs = fiona.crs.from_epsg(work_epsg) if work_epsg else {}
+            # CRS para o Fiona: preferir EPSG numérico, fallback para WKT do QGIS
+            if work_epsg:
+                fiona_crs = fiona.crs.from_epsg(work_epsg)
+            else:
+                try:
+                    fiona_crs = fiona.crs.from_wkt(work_crs_qgs.toWkt())
+                except Exception:
+                    fiona_crs = {}
 
             # Gravar em streaming — abrir ficheiro uma vez, escrever batch a batch
             BATCH_SIZE = 50_000   # features por flush para disco
@@ -851,6 +902,22 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             feedback=feedback,
         )["OUTPUT"]
 
+        # Remover geometrias com coordenadas inválidas (NaN/Inf) que causam
+        # "Coordinates with non-finite values" ao gravar em shapefile/gpkg.
+        # Isto pode ocorrer quando features de diferentes SRCs são mescladas
+        # ou quando a reprojeção falha em geometrias degeneradas.
+        feedback.pushInfo(self.tr("A validar geometrias da rede final..."))
+        merged_network = processing.run(
+            "native:fixgeometries",
+            {
+                "INPUT":  merged_network,
+                "METHOD": 1,
+                "OUTPUT": "TEMPORARY_OUTPUT",
+            },
+            context=context,
+            feedback=feedback,
+        )["OUTPUT"]
+
         del central_routes, clipped_transects
         gc.collect()
         feedback.setProgress(90)
@@ -868,7 +935,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 {
                     "INPUT":      merged_network,
                     "TARGET_CRS": output_crs_param,
-                    "OUTPUT":     parameters[self.OUTPUT_NETWORK],
+                    final_path = os.path.join(tmp, "final_network.gpkg")  "OUTPUT": final_path,
                 },
                 context=context,
                 feedback=feedback,
@@ -885,7 +952,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 {
                     "INPUT":      merged_network,
                     "TARGET_CRS": work_crs_qgs,
-                    "OUTPUT":     parameters[self.OUTPUT_NETWORK],
+                    final_path = os.path.join(tmp, "final_network.gpkg")  "OUTPUT": final_path,
                 },
                 context=context,
                 feedback=feedback,
