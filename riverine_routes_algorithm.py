@@ -922,18 +922,18 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         gc.collect()
         feedback.setProgress(90)
 
-        # ── E. REPROJETAR SAÍDA (se definido pelo utilizador) ───────────
-    if output_crs_param and output_crs_param.isValid():
-        out_epsg = output_crs_param.postgisSrid()
-        feedback.pushInfo(
-            self.tr(f"A reprojetar a rede final para EPSG:{out_epsg}...")
-        )
-        output_path = parameters[self.OUTPUT_NETWORK]
-        
-    # força extensão .gpkg
-        if not str(output_path).lower().endswith(".gpkg"):
-            output_path = str(output_path) + ".gpkg"
-            
+        # ── E. REPROJETAR SAÍDA ────────────────────────────────────────
+        if output_crs_param and output_crs_param.isValid():
+            out_epsg = output_crs_param.postgisSrid()
+            feedback.pushInfo(
+                self.tr(f"A reprojetar a rede final para EPSG:{out_epsg}...")
+            )
+
+            output_path = parameters[self.OUTPUT_NETWORK]
+
+            if not str(output_path).lower().endswith(".gpkg"):
+                output_path = str(output_path) + ".gpkg"
+
             final_network = processing.run(
                 "native:reprojectlayer",
                 {
@@ -944,7 +944,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 context=context,
                 feedback=feedback,
             )["OUTPUT"]
-        
+
         else:
             feedback.pushInfo(
                 self.tr(
@@ -952,9 +952,9 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     f"Rede gerada no SRC de processamento (EPSG:{work_epsg})."
                 )
             )
-            
+
             final_path = os.path.join(tmp, "final_network.gpkg")
-            
+
             final_network = processing.run(
                 "native:reprojectlayer",
                 {
@@ -965,8 +965,8 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 context=context,
                 feedback=feedback,
             )["OUTPUT"]
-            
-            feedback.setProgress(100)
-            feedback.pushInfo(self.tr("Rede fluvial concluida com sucesso."))
-            
-            return {self.OUTPUT_NETWORK: final_network}
+
+        feedback.setProgress(100)
+        feedback.pushInfo(self.tr("Rede fluvial concluida com sucesso."))
+
+        return {self.OUTPUT_NETWORK: final_network}
