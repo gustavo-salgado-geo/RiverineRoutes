@@ -245,7 +245,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             self.BUFFER_DIST,
             self.tr("Distância do Buffer Marginal (metros)"),
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=50.0,
+            defaultValue=200.0,
             minValue=1.0,
         )
         param_buffer.setMetadata(
@@ -258,7 +258,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             self.TRANSECT_INTERVAL,
             self.tr("Distância entre Rotas Transversais (metros)"),
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=100.0,
+            defaultValue=1000.0,
             minValue=1.0,
         )
         param_transect.setMetadata(
