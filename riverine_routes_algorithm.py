@@ -27,6 +27,7 @@ import rasterio
 import rasterio.windows
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from skimage.morphology import skeletonize, binary_closing, binary_opening, remove_small_objects, disk
+from scipy.ndimage import label as nd_label, convolve as nd_convolve
 from shapely.geometry import LineString
 from shapely.ops import nearest_points
 
@@ -754,10 +755,50 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         skeleton_bool = skeletonize(data_bool)
         del data_bool
         gc.collect()
+        feedback.setProgress(37)
+
+        # ── PODA DE RAMOS CURTOS (PRUNING) ─────────────────────────────
+        #
+        # O skeletonize gera ramos espúrios em:
+        #   • Confluências (triângulo em vez de Y)
+        #   • Bordas irregulares da máscara (pequenos "pelos")
+        #   • Ilhas e concavidades
+        #
+        # Algoritmo de poda iterativa:
+        #   Um pixel de esqueleto é "terminal" se tiver exactamente 1
+        #   vizinho activo na vizinhança 3×3. Remover terminais iterativamente
+        #   elimina ramos curtos sem afectar o canal principal.
+        #
+        # PRUNE_PX = comprimento máximo a podar em pixels
+        #   = buffer_dist_m / pixel_size_m × 0.5
+        #   (ramos menores que metade do buffer são considerados espúrios)
+        # ---------------------------------------------------------------
+        prune_px = max(3, int(round((buffer_dist_m * 0.5) / max(pixel_size_m, 1e-6))))
+        feedback.pushInfo(self.tr(f"  Poda de ramos curtos: prune_px={prune_px}px ({prune_px * pixel_size_m:.1f}m)..."))
+
+        skel = skeleton_bool.copy()
+        del skeleton_bool
+        gc.collect()
+
+        # Kernel de vizinhança 3×3 para contar vizinhos
+        neighbor_kernel = np.ones((3, 3), dtype=np.uint8)
+        neighbor_kernel[1, 1] = 0   # não contar o próprio pixel
+
+        for _iter in range(prune_px):
+            if not skel.any():
+                break
+            # Contar vizinhos activos de cada pixel
+            neighbor_count = nd_convolve(skel.astype(np.uint8), neighbor_kernel, mode="constant", cval=0)
+            # Terminal: pixel activo com exactamente 1 vizinho
+            terminals = skel & (neighbor_count == 1)
+            if not terminals.any():
+                break
+            skel = skel & ~terminals
+
         feedback.setProgress(40)
 
-        skeleton_uint8 = skeleton_bool.astype(np.uint8)
-        del skeleton_bool
+        skeleton_uint8 = skel.astype(np.uint8)
+        del skel
         gc.collect()
 
         feedback.pushInfo(self.tr("Fase 3/3: a gravar esqueleto em disco..."))
@@ -803,7 +844,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         #     flush a cada BATCH_SIZE features, gc.collect() após cada flush.
         # ---------------------------------------------------------------
         from rasterio.features import shapes as rasterio_shapes
-        from shapely.geometry  import shape as shapely_shape
+        from shapely.geometry  import shape as shapely_shape, LineString as ShpLineString
         from osgeo             import ogr, osr
 
         temp_central_path = os.path.join(tmp, "temp_central.gpkg")
@@ -872,9 +913,19 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     if val == 0:
                         continue
                     geom = shapely_shape(geom_dict)
-                    line = geom.boundary.simplify(simplify_tol, preserve_topology=False)
+
+                    # Passo 1: simplify — remove vértices redundantes dos degraus de pixel
+                    # Tolerância = 1.5× o tamanho do pixel para colapsar degraus
+                    line = geom.boundary.simplify(simplify_tol * 1.5, preserve_topology=False)
                     if line.is_empty:
                         continue
+
+                    # Passo 2: suavização de Chaikin — arredonda os "cotovelos" que
+                    # sobram depois do simplify. Aplica 3 iterações do algoritmo de
+                    # subdivisão de Chaikin: cada segmento é substituído por dois
+                    # pontos a 1/4 e 3/4 do segmento original, produzindo uma curva
+                    # suave que passa próximo dos pontos originais.
+                    # Apenas aplicado a linhas com >= 3 vértices.
                     parts = (
                         list(line.geoms)
                         if line.geom_type == "MultiLineString"
@@ -883,7 +934,25 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     for part in parts:
                         if part.is_empty or part.length == 0:
                             continue
-                        ogr_geom = ogr.CreateGeometryFromWkt(part.wkt)
+                        coords = list(part.coords)
+                        # Chaikin: 3 iterações
+                        for _ in range(3):
+                            if len(coords) < 3:
+                                break
+                            new_coords = [coords[0]]
+                            for j in range(len(coords) - 1):
+                                x0, y0 = coords[j]
+                                x1, y1 = coords[j + 1]
+                                new_coords.append((0.75*x0 + 0.25*x1, 0.75*y0 + 0.25*y1))
+                                new_coords.append((0.25*x0 + 0.75*x1, 0.25*y0 + 0.75*y1))
+                            new_coords.append(coords[-1])
+                            coords = new_coords
+                        if len(coords) < 2:
+                            continue
+                        smooth_line = ShpLineString(coords)
+                        if smooth_line.is_empty or smooth_line.length == 0:
+                            continue
+                        ogr_geom = ogr.CreateGeometryFromWkt(smooth_line.wkt)
                         if ogr_geom is None:
                             continue
                         feat = ogr.Feature(lyr_defn)
