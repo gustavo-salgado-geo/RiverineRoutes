@@ -923,23 +923,28 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgress(90)
 
         # ── E. REPROJETAR SAÍDA (se definido pelo utilizador) ───────────
-        if output_crs_param and output_crs_param.isValid():
-            out_epsg = output_crs_param.postgisSrid()
-            feedback.pushInfo(
-                self.tr(
-                    f"A reprojetar a rede final para EPSG:{out_epsg}..."
-                )
-            )
+    if output_crs_param and output_crs_param.isValid():
+        out_epsg = output_crs_param.postgisSrid()
+        feedback.pushInfo(
+            self.tr(f"A reprojetar a rede final para EPSG:{out_epsg}...")
+        )
+        output_path = parameters[self.OUTPUT_NETWORK]
+        
+    # força extensão .gpkg
+        if not str(output_path).lower().endswith(".gpkg"):
+            output_path = str(output_path) + ".gpkg"
+            
             final_network = processing.run(
                 "native:reprojectlayer",
                 {
-                    "INPUT":      merged_network,
+                    "INPUT": merged_network,
                     "TARGET_CRS": output_crs_param,
-                    final_path = os.path.join(tmp, "final_network.gpkg")  "OUTPUT": final_path,
+                    "OUTPUT": output_path,
                 },
                 context=context,
                 feedback=feedback,
             )["OUTPUT"]
+        
         else:
             feedback.pushInfo(
                 self.tr(
@@ -947,17 +952,20 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     f"Rede gerada no SRC de processamento (EPSG:{work_epsg})."
                 )
             )
+            
+            final_path = os.path.join(tmp, "final_network.gpkg")
+            
             final_network = processing.run(
                 "native:reprojectlayer",
                 {
-                    "INPUT":      merged_network,
+                    "INPUT": merged_network,
                     "TARGET_CRS": work_crs_qgs,
-                    final_path = os.path.join(tmp, "final_network.gpkg")  "OUTPUT": final_path,
+                    "OUTPUT": final_path,
                 },
                 context=context,
                 feedback=feedback,
             )["OUTPUT"]
-
-        feedback.setProgress(100)
-        feedback.pushInfo(self.tr("Rede fluvial concluida com sucesso."))
-        return {self.OUTPUT_NETWORK: final_network}
+            
+            feedback.setProgress(100)
+            feedback.pushInfo(self.tr("Rede fluvial concluida com sucesso."))
+return {self.OUTPUT_NETWORK: final_network}
