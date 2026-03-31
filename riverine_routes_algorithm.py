@@ -26,7 +26,7 @@ import numpy as np
 import rasterio
 import rasterio.windows
 from rasterio.warp import calculate_default_transform, reproject, Resampling
-from skimage.morphology import skeletonize
+from skimage.morphology import skeletonize, binary_closing, binary_opening, remove_small_objects, disk
 from shapely.geometry import LineString
 from shapely.ops import nearest_points
 
@@ -679,23 +679,84 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     if feedback.isCanceled():
                         return {}
 
-        feedback.pushInfo(self.tr("Fase 2/3: a esqueletonizar (toda a imagem em RAM)..."))
+        feedback.pushInfo(self.tr("Fase 2/3: a pre-processar e esqueletonizar (toda a imagem em RAM)..."))
 
-        # FASE 2: carregar uint8 comprimido → bool → skeletonize → uint8
+        # FASE 2: carregar → pré-processar → skeletonize → uint8
+        #
+        # PRÉ-PROCESSAMENTO (ordem importa):
+        #
+        # 1. REMOÇÃO DE ILHAS PEQUENAS (remove_small_objects):
+        #    Elimina manchas de pixels isolados (ruído, pixels soltos)
+        #    menores que MIN_ISLAND_PX pixels. Sem isto, cada pixel isolado
+        #    gera um esqueleto espúrio.
+        #    MIN_ISLAND_PX = área em pixels equivalente a um círculo de
+        #    raio = buffer_dist_m / pixel_size. Assim, apenas objectos com
+        #    área relevante para navegação são mantidos.
+        #
+        # 2. FECHO MORFOLÓGICO (binary_closing):
+        #    Preenche buracos pequenos e gaps na máscara (ilhas minúsculas,
+        #    pixels pretos espúrios dentro do canal). Um rio contínuo deve
+        #    ter uma máscara contínua — gaps causam descontinuidades no
+        #    esqueleto. Kernel circular de raio CLOSE_R pixels.
+        #
+        # 3. SUAVIZAÇÃO DAS BORDAS (binary_opening):
+        #    Remove protuberâncias finas nas bordas da máscara (efeito
+        #    "dentes de serra" de pixelização). Reduz drasticamente as
+        #    ramificações falsas no esqueleto. Kernel circular de raio
+        #    OPEN_R pixels (menor que CLOSE_R para não destruir canais finos).
+        #
+        # Os raios são calculados em pixels a partir de buffer_dist_m,
+        # garantindo que as operações morfológicas são proporcionais à
+        # escala real do dado independentemente da resolução do raster.
+        # ---------------------------------------------------------------
         with rasterio.open(temp_uint8_path) as src:
-            data_uint8 = src.read(1)                    # uint8, menor footprint
-        feedback.setProgress(30)
+            data_uint8  = src.read(1)
+            pixel_size_m = abs(src.transform.a)   # metros por pixel
+        feedback.setProgress(22)
 
-        data_bool  = data_uint8 > 0                     # bool (1 bit lógico, 1 byte real)
+        data_bool = data_uint8 > 0
         del data_uint8
         gc.collect()
 
-        skeleton_bool = skeletonize(data_bool)           # bool
+        # Calcular raios morfológicos em pixels
+        # CLOSE_R: preenche gaps até ~10% do buffer marginal
+        # OPEN_R:  suaviza bordas a ~5% do buffer marginal (metade do close)
+        # MIN_ISLAND_PX: área mínima = círculo de raio = buffer/2
+        close_r         = max(1, int(round((buffer_dist_m * 0.10) / max(pixel_size_m, 1e-6))))
+        open_r          = max(1, int(round((buffer_dist_m * 0.05) / max(pixel_size_m, 1e-6))))
+        min_island_px   = max(10, int(3.14159 * ((buffer_dist_m * 0.5) / max(pixel_size_m, 1e-6)) ** 2))
+
+        feedback.pushInfo(self.tr(
+            f"Pre-processamento morfologico: pixel={pixel_size_m:.2f}m | "
+            f"close_r={close_r}px | open_r={open_r}px | min_island={min_island_px}px"
+        ))
+
+        # 1. Remover ilhas pequenas
+        feedback.pushInfo(self.tr("  Removendo objectos pequenos (ruido)..."))
+        data_bool = remove_small_objects(data_bool, min_size=min_island_px, connectivity=2)
+        gc.collect()
+        feedback.setProgress(25)
+
+        # 2. Fecho morfológico — preencher gaps e buracos
+        feedback.pushInfo(self.tr("  Fecho morfologico (preenchimento de gaps)..."))
+        data_bool = binary_closing(data_bool, footprint=disk(close_r))
+        gc.collect()
+        feedback.setProgress(30)
+
+        # 3. Abertura morfológica — suavizar bordas
+        feedback.pushInfo(self.tr("  Abertura morfologica (suavizacao de bordas)..."))
+        data_bool = binary_opening(data_bool, footprint=disk(open_r))
+        gc.collect()
+        feedback.setProgress(33)
+
+        # Esqueletonizar a máscara pré-processada
+        feedback.pushInfo(self.tr("  Esqueletonizando..."))
+        skeleton_bool = skeletonize(data_bool)
         del data_bool
         gc.collect()
         feedback.setProgress(40)
 
-        skeleton_uint8 = skeleton_bool.astype(np.uint8)  # uint8
+        skeleton_uint8 = skeleton_bool.astype(np.uint8)
         del skeleton_bool
         gc.collect()
 
