@@ -84,7 +84,16 @@ def _get_raster_center_lonlat(raster_path: str):
         return cx, cy   # já em graus
 
     dst_srs = osr.SpatialReference()
-    dst_srs.ImportFromEPSG(4326)
+    # WKT do WGS84 GEOGCS embutido — não consulta o proj.db
+    _wgs84_wkt = (
+        'GEOGCS["WGS 84",DATUM["WGS_1984",'
+        'SPHEROID["WGS 84",6378137,298.257223563]],'
+        'PRIMEM["Greenwich",0],'
+        'UNIT["degree",0.0174532925199433,'
+        'AUTHORITY["EPSG","9122"]],'
+        'AUTHORITY["EPSG","4326"]]'
+    )
+    dst_srs.ImportFromWkt(_wgs84_wkt)
     dst_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
 
     ct = osr.CoordinateTransformation(src_srs, dst_srs)
@@ -735,19 +744,19 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         temp_central_path = os.path.join(tmp, "temp_central.gpkg")
 
-        # ── Definir SRS via OSR (usa o PROJ do OSGeo4W, não o do pip) ──
+        # ── Definir SRS via WKT do QGIS — NÃO usa proj.db ────────────
+        # ImportFromEPSG() consulta o proj.db e falha quando há múltiplas
+        # instalações do PROJ no sistema (OSGeo4W + Anaconda, etc.).
+        # ImportFromWkt() lê a definição da string — sem aceder ao proj.db.
+        # O QGIS já tem o WKT correcto em work_crs_qgs.toWkt().
         srs = osr.SpatialReference()
         srs_ok = False
-        if work_epsg:
-            ret = srs.ImportFromEPSG(work_epsg)
+        try:
+            wkt_str = work_crs_qgs.toWkt()
+            ret = srs.ImportFromWkt(wkt_str)
             srs_ok = (ret == 0)
-        if not srs_ok:
-            # Fallback: WKT do QGIS
-            try:
-                ret = srs.ImportFromWkt(work_crs_qgs.toWkt())
-                srs_ok = (ret == 0)
-            except Exception:
-                pass
+        except Exception:
+            pass
         if not srs_ok:
             feedback.pushWarning(self.tr(
                 "Nao foi possivel definir o SRS para o ficheiro central. "
