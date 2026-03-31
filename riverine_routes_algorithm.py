@@ -1004,11 +1004,10 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     nbs = _get_active_neighbors(cur_r, cur_c)
                     if not nbs:
                         break
-                    # Se há múltiplos vizinhos não visitados: parar (chegou a junção)
+                    # Se há múltiplos vizinhos não visitados: chegou a junção.
+                    # Parar aqui — não adicionar o pixel de junção à cadeia
+                    # (ele pertence ao ponto de arranque de outras cadeias).
                     if len(nbs) > 1:
-                        # Marcar como ponto de chegada mas não marcar como visitado
-                        # (outras cadeias arrancarão daqui)
-                        chain.append(nbs[0])
                         break
                     next_r, next_c = nbs[0]
                     chain.append((next_r, next_c))
@@ -1026,9 +1025,67 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 if feedback.isCanceled():
                     return {}
 
+        # ── SEGUNDA PASSAGEM: pixels orphaned ──────────────────────────
+        # Pixels activos que não foram visitados na primeira passagem.
+        # Isso acontece quando:
+        #   • Um pixel interno tem todos os seus vizinhos já visitados
+        #     por ramos diferentes — nunca é incluído em nenhuma cadeia.
+        #   • Trechos diagonais onde o rastreio "saltou" por cima.
+        #   • Pixels em loops circulares sem terminal nem junção.
+        #
+        # Estratégia: encontrar todos os pixels activos não visitados,
+        # agrupá-los por conectividade (scipy.ndimage.label) e rastrear
+        # cada grupo independentemente a partir do seu primeiro pixel.
+        orphaned_mask = skel_arr & ~visited
+        n_orphaned = int(orphaned_mask.sum())
+        if n_orphaned > 0:
+            feedback.pushInfo(self.tr(
+                f"  Segunda passagem: {n_orphaned} pixels orphaned a rastrear..."
+            ))
+            # Agrupar pixels orphaned por conectividade 8-conexa
+            struct_8 = np.ones((3, 3), dtype=bool)
+            labeled_orphans, n_groups = nd_label(orphaned_mask, structure=struct_8)
+
+            for grp in range(1, n_groups + 1):
+                grp_mask = labeled_orphans == grp
+                grp_rows, grp_cols = np.where(grp_mask)
+                if len(grp_rows) < 2:
+                    # Pixel isolado — ignorar
+                    visited[grp_rows[0], grp_cols[0]] = True
+                    continue
+
+                # Ponto de arranque: primeiro pixel do grupo
+                sr2, sc2 = int(grp_rows[0]), int(grp_cols[0])
+
+                # Mini-rastreio dentro do grupo
+                chain2 = []
+                stack  = [(sr2, sc2)]
+                v2     = np.zeros_like(skel_arr, dtype=bool)
+
+                while stack:
+                    cr, cc = stack.pop()
+                    if v2[cr, cc]:
+                        continue
+                    v2[cr, cc]      = True
+                    visited[cr, cc] = True
+                    chain2.append((cr, cc))
+                    for dr, dc in NEIGHBORS_8:
+                        nr2, nc2 = cr + dr, cc + dc
+                        if 0 <= nr2 < skel_arr.shape[0] and 0 <= nc2 < skel_arr.shape[1]:
+                            if skel_arr[nr2, nc2] and not v2[nr2, nc2]:
+                                stack.append((nr2, nc2))
+
+                if len(chain2) >= 2:
+                    lines_rc.append(chain2)
+
+        n_after_orphan = int((skel_arr & ~visited).sum())
+        feedback.pushInfo(self.tr(
+            f"Rastreio concluido: {len(lines_rc)} cadeias | "
+            f"{n_after_orphan} pixels ainda nao cobertos (isolados)."
+        ))
+
         del skel_arr, visited, terminals, internals, junctions, n_neighbors
         gc.collect()
-        feedback.pushInfo(self.tr(f"Rastreio concluido: {len(lines_rc)} cadeias encontradas."))
         feedback.setProgress(58)
 
         # ── Converter cadeias (row,col) → LineStrings Shapely ──────────
