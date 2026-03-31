@@ -992,7 +992,106 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr(f"Rastreio concluido: {len(lines_rc)} cadeias encontradas."))
         feedback.setProgress(58)
 
-        # ── Converter cadeias (row,col) → LineStrings e gravar ─────────
+        # ── Converter cadeias (row,col) → LineStrings Shapely ──────────
+        # Fase 1: converter todas as cadeias para LineStrings reais,
+        #         aplicando simplify + Chaikin para suavização.
+        # Fase 2: linemerge para unir segmentos que se tocam nas pontas.
+        # Fase 3: deduplicação por distância média (Hausdorff aproximado)
+        #         para eliminar linhas paralelas remanescentes.
+        # Fase 4: gravar via OGR.
+
+        from shapely.ops import linemerge, unary_union as shp_unary_union
+        from shapely.geometry import MultiLineString as ShpMultiLine
+
+        simplify_tol = pixel_size * 1.5
+        shapely_lines = []
+
+        feedback.pushInfo(self.tr("  Convertendo cadeias para LineStrings e suavizando..."))
+        for chain in lines_rc:
+            coords = [_rc_to_xy(r, c) for r, c in chain]
+            if len(coords) < 2:
+                continue
+            line = ShpLineString(coords).simplify(simplify_tol, preserve_topology=False)
+            if line.is_empty or line.length == 0:
+                continue
+            smooth_coords = _chaikin(list(line.coords), iters=3)
+            if len(smooth_coords) < 2:
+                continue
+            sl = ShpLineString(smooth_coords)
+            if not sl.is_empty and sl.length > 0:
+                shapely_lines.append(sl)
+
+        del lines_rc
+        gc.collect()
+        feedback.pushInfo(self.tr(f"  {len(shapely_lines)} segmentos antes do merge."))
+
+        # ── LINEMERGE: unir segmentos que se tocam nas extremidades ─────
+        # Elimina a fragmentação — segmentos contíguos tornam-se uma linha
+        # única contínua, o que melhora drasticamente a qualidade das
+        # transversais (interpolate opera sobre o comprimento total).
+        feedback.pushInfo(self.tr("  Unindo segmentos contiguos (linemerge)..."))
+        merged = linemerge(shapely_lines)
+        del shapely_lines
+        gc.collect()
+
+        if merged.geom_type == "LineString":
+            merged_lines = [merged]
+        elif merged.geom_type == "MultiLineString":
+            merged_lines = list(merged.geoms)
+        else:
+            # GeometryCollection — extrair apenas LineStrings
+            merged_lines = [g for g in merged.geoms if g.geom_type == "LineString"]
+
+        feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos linemerge."))
+
+        # ── DEDUPLICAÇÃO POR DISTÂNCIA MÉDIA (Hausdorff aproximado) ────
+        # Compara amostras de pontos ao longo de cada par de linhas.
+        # Duas linhas são paralelas se a distância média entre amostras
+        # for menor que DEDUP_DIST (3 pixels). Mantém a mais longa.
+        # Muito mais robusto que comparar apenas o ponto médio.
+        DEDUP_DIST  = pixel_size * 3.0
+        N_SAMPLES   = 10   # pontos amostrados por linha para comparação
+
+        def _avg_dist(la, lb):
+            """Distância média entre N_SAMPLES pontos de la e lb."""
+            total = 0.0
+            for k in range(N_SAMPLES):
+                t = k / max(N_SAMPLES - 1, 1)
+                pa = la.interpolate(t, normalized=True)
+                dist = lb.distance(pa)
+                total += dist
+            return total / N_SAMPLES
+
+        if len(merged_lines) > 1:
+            feedback.pushInfo(self.tr(f"  Deduplicando {len(merged_lines)} linhas por distancia media..."))
+            keep = [True] * len(merged_lines)
+            lengths = [l.length for l in merged_lines]
+            for i in range(len(merged_lines)):
+                if not keep[i]:
+                    continue
+                for j in range(i + 1, len(merged_lines)):
+                    if not keep[j]:
+                        continue
+                    # Verificação rápida por bounding box antes do cálculo completo
+                    bi = merged_lines[i].bounds
+                    bj = merged_lines[j].bounds
+                    bb_dist = max(
+                        max(bi[0], bj[0]) - min(bi[2], bj[2]),
+                        max(bi[1], bj[1]) - min(bi[3], bj[3]),
+                        0
+                    )
+                    if bb_dist > DEDUP_DIST * 2:
+                        continue   # bounding boxes distantes — não são paralelas
+                    if _avg_dist(merged_lines[i], merged_lines[j]) < DEDUP_DIST:
+                        if lengths[i] >= lengths[j]:
+                            keep[j] = False
+                        else:
+                            keep[i] = False
+                            break
+            merged_lines = [l for l, k in zip(merged_lines, keep) if k]
+            feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos deduplicacao."))
+
+        # ── Gravar via OGR ──────────────────────────────────────────────
         temp_central_path = os.path.join(tmp, "temp_central.gpkg")
 
         srs = osr.SpatialReference()
@@ -1012,67 +1111,13 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         lyr.CreateField(fdef)
         lyr_defn = lyr.GetLayerDefn()
 
-        # Tolerância de simplify = 1.5 pixels (colapsa degraus da grade)
-        simplify_tol = pixel_size * 1.5
-        feat_count   = 0
-        BATCH_SIZE   = 20_000
-
-        # ── DEDUPLICAÇÃO DE LINHAS PARALELAS ───────────────────────────
-        # Se o thin() não eliminar completamente os pares de pixels
-        # paralelos, o rastreio gera duas linhas muito próximas.
-        # Estratégia: para cada par de linhas cujos pontos médios distam
-        # menos que DEDUP_DIST (= 2 pixels), manter apenas a mais longa.
-        # Funciona em O(n²) mas o número de cadeias é pequeno após pruning.
-        DEDUP_DIST = pixel_size * 2.5   # 2.5 pixels de distância máxima
-        if len(lines_rc) > 1:
-            feedback.pushInfo(self.tr(f"  Deduplicando {len(lines_rc)} cadeias..."))
-            keep = [True] * len(lines_rc)
-            # Calcular ponto médio de cada cadeia em coordenadas reais
-            def _midpoint(chain):
-                mid = chain[len(chain) // 2]
-                return _rc_to_xy(mid[0], mid[1])
-            mids = [_midpoint(c) for c in lines_rc]
-            lens = [len(c) for c in lines_rc]
-            for i in range(len(lines_rc)):
-                if not keep[i]:
-                    continue
-                for j in range(i + 1, len(lines_rc)):
-                    if not keep[j]:
-                        continue
-                    dx = mids[i][0] - mids[j][0]
-                    dy = mids[i][1] - mids[j][1]
-                    if (dx*dx + dy*dy) ** 0.5 < DEDUP_DIST:
-                        # Descartar a mais curta
-                        if lens[i] >= lens[j]:
-                            keep[j] = False
-                        else:
-                            keep[i] = False
-                            break
-            lines_rc = [c for c, k in zip(lines_rc, keep) if k]
-            feedback.pushInfo(self.tr(f"  Apos deduplicacao: {len(lines_rc)} cadeias."))
-
+        feat_count = 0
+        BATCH_SIZE = 20_000
         lyr.StartTransaction()
 
-        for ci, chain in enumerate(lines_rc):
-            # Converter (row,col) → coordenadas reais
-            coords = [_rc_to_xy(r, c) for r, c in chain]
-            if len(coords) < 2:
-                continue
-
-            # Simplify — colapsa degraus de pixel
-            line = ShpLineString(coords).simplify(simplify_tol, preserve_topology=False)
-            if line.is_empty or line.length == 0:
-                continue
-
-            # Chaikin — suaviza cotovelos residuais
-            smooth_coords = _chaikin(list(line.coords), iters=3)
-            if len(smooth_coords) < 2:
-                continue
-
-            smooth_line = ShpLineString(smooth_coords)
+        for smooth_line in merged_lines:
             if smooth_line.is_empty or smooth_line.length == 0:
                 continue
-
             ogr_geom = ogr.CreateGeometryFromWkt(smooth_line.wkt)
             if ogr_geom is None:
                 continue
@@ -1091,7 +1136,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         lyr.CommitTransaction()
         ds_cent = None
-        del lines_rc
+        del merged_lines
         gc.collect()
         feedback.pushInfo(self.tr(f"Vectorizacao concluida: {feat_count} segmentos gravados."))
         feedback.setProgress(58)
