@@ -26,7 +26,7 @@ import numpy as np
 import rasterio
 import rasterio.windows
 from rasterio.warp import calculate_default_transform, reproject, Resampling
-from skimage.morphology import skeletonize, binary_closing, binary_opening, remove_small_objects, disk
+from skimage.morphology import skeletonize, thin as skimage_thin, binary_closing, binary_opening, remove_small_objects, disk
 from scipy.ndimage import label as nd_label, convolve as nd_convolve
 from shapely.geometry import LineString
 from shapely.ops import nearest_points
@@ -755,6 +755,17 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         skeleton_bool = skeletonize(data_bool)
         del data_bool
         gc.collect()
+        feedback.setProgress(35)
+
+        # ── AFINAMENTO ADICIONAL (thin) ─────────────────────────────────
+        # skeletonize() pode deixar trechos com 2 pixels de largura,
+        # especialmente em curvas e confluências. Isso gera duas linhas
+        # paralelas no rastreio de grafo.
+        # thin() aplica o algoritmo de Zhang-Suen iterativamente até
+        # convergência, garantindo largura de exactamente 1 pixel.
+        feedback.pushInfo(self.tr("  Afinamento (thin) para garantir 1 pixel de largura..."))
+        skeleton_bool = skimage_thin(skeleton_bool)
+        gc.collect()
         feedback.setProgress(37)
 
         # ── PODA DE RAMOS CURTOS (PRUNING) ─────────────────────────────
@@ -1005,6 +1016,41 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         simplify_tol = pixel_size * 1.5
         feat_count   = 0
         BATCH_SIZE   = 20_000
+
+        # ── DEDUPLICAÇÃO DE LINHAS PARALELAS ───────────────────────────
+        # Se o thin() não eliminar completamente os pares de pixels
+        # paralelos, o rastreio gera duas linhas muito próximas.
+        # Estratégia: para cada par de linhas cujos pontos médios distam
+        # menos que DEDUP_DIST (= 2 pixels), manter apenas a mais longa.
+        # Funciona em O(n²) mas o número de cadeias é pequeno após pruning.
+        DEDUP_DIST = pixel_size * 2.5   # 2.5 pixels de distância máxima
+        if len(lines_rc) > 1:
+            feedback.pushInfo(self.tr(f"  Deduplicando {len(lines_rc)} cadeias..."))
+            keep = [True] * len(lines_rc)
+            # Calcular ponto médio de cada cadeia em coordenadas reais
+            def _midpoint(chain):
+                mid = chain[len(chain) // 2]
+                return _rc_to_xy(mid[0], mid[1])
+            mids = [_midpoint(c) for c in lines_rc]
+            lens = [len(c) for c in lines_rc]
+            for i in range(len(lines_rc)):
+                if not keep[i]:
+                    continue
+                for j in range(i + 1, len(lines_rc)):
+                    if not keep[j]:
+                        continue
+                    dx = mids[i][0] - mids[j][0]
+                    dy = mids[i][1] - mids[j][1]
+                    if (dx*dx + dy*dy) ** 0.5 < DEDUP_DIST:
+                        # Descartar a mais curta
+                        if lens[i] >= lens[j]:
+                            keep[j] = False
+                        else:
+                            keep[i] = False
+                            break
+            lines_rc = [c for c, k in zip(lines_rc, keep) if k]
+            feedback.pushInfo(self.tr(f"  Apos deduplicacao: {len(lines_rc)} cadeias."))
+
         lyr.StartTransaction()
 
         for ci, chain in enumerate(lines_rc):
