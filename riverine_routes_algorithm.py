@@ -23,7 +23,6 @@ import numpy as np
 import rasterio
 import rasterio.windows
 from rasterio.warp import calculate_default_transform, reproject, Resampling
-from pyproj import CRS as ProjCRS
 from skimage.morphology import skeletonize
 from shapely.geometry import LineString
 from shapely.ops import nearest_points
@@ -34,15 +33,21 @@ from shapely.ops import nearest_points
 # ---------------------------------------------------------------------------
 
 def _is_geographic(crs_wkt: str) -> bool:
-    """Devolve True se o CRS está em graus (geográfico), False se já é métrico."""
+    """Devolve True se o CRS está em graus (geográfico), False se já é métrico.
+    Usa osgeo.osr (GDAL/OSGeo4W) em vez de pyproj para evitar conflitos de
+    instalação em ambientes com múltiplos PROJ (ex: OSGeo4W + pip).
+    """
     try:
-        proj_crs = ProjCRS.from_wkt(crs_wkt)
-        return proj_crs.is_geographic
+        from osgeo import osr
+        srs = osr.SpatialReference()
+        ret = srs.ImportFromWkt(crs_wkt)
+        if ret == 0:
+            return bool(srs.IsGeographic())
     except Exception:
-        # Fallback heurístico: EPSG:4326 e variantes comuns
-        wkt_upper = crs_wkt.upper()
-        geographic_hints = ["GEOGCS", "GEOGRAPHIC", "DEGREE", "DECIMAL_DEGREE"]
-        return any(hint in wkt_upper for hint in geographic_hints)
+        pass
+    # Fallback heurístico — sem dependência externa
+    wkt_upper = crs_wkt.upper()
+    return any(h in wkt_upper for h in ["GEOGCS", "GEOGRAPHIC", "DEGREE", "DECIMAL_DEGREE"])
 
 
 def _auto_utm_epsg(lon: float, lat: float) -> int:
@@ -58,18 +63,34 @@ def _auto_utm_epsg(lon: float, lat: float) -> int:
 
 
 def _get_raster_center_lonlat(raster_path: str):
-    """Devolve (lon, lat) do centro do raster no CRS geográfico WGS84."""
+    """Devolve (lon, lat) do centro do raster em WGS84.
+    Usa osgeo.osr (GDAL/OSGeo4W) para a transformação de coordenadas,
+    evitando dependência do pyproj instalado via pip.
+    """
+    from osgeo import osr, ogr as _ogr
     with rasterio.open(raster_path) as src:
         bounds = src.bounds
         cx = (bounds.left + bounds.right) / 2
         cy = (bounds.bottom + bounds.top) / 2
-        raster_crs = ProjCRS.from_wkt(src.crs.to_wkt())
-        if raster_crs.is_geographic:
-            return cx, cy
-        # Converter centro para WGS84
-        from pyproj import Transformer
-        transformer = Transformer.from_crs(raster_crs, ProjCRS.from_epsg(4326), always_xy=True)
-        return transformer.transform(cx, cy)
+        crs_wkt = src.crs.to_wkt() if src.crs else None
+
+    if crs_wkt is None:
+        return cx, cy   # sem SRC — devolver como estão
+
+    src_srs = osr.SpatialReference()
+    src_srs.ImportFromWkt(crs_wkt)
+
+    if src_srs.IsGeographic():
+        return cx, cy   # já em graus
+
+    dst_srs = osr.SpatialReference()
+    dst_srs.ImportFromEPSG(4326)
+    dst_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+    ct = osr.CoordinateTransformation(src_srs, dst_srs)
+    point = _ogr.CreateGeometryFromWkt(f"POINT ({cx} {cy})")
+    point.Transform(ct)
+    return point.GetX(), point.GetY()
 
 
 def _reproject_raster_to_metric(raster_path: str, target_epsg: int, tmp_folder: str) -> str:
@@ -430,13 +451,15 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             except Exception:
                 pass
 
-            # Tentativa 2: pyproj (fallback para SRCs não-EPSG)
+            # Tentativa 2: osr (fallback para SRCs não-EPSG)
             if work_epsg is None:
                 try:
-                    proj_crs = ProjCRS.from_wkt(raster_crs_wkt)
-                    auth     = proj_crs.to_authority()
-                    if auth:
-                        work_epsg = int(auth[1])
+                    from osgeo import osr as _osr2
+                    _srs2 = _osr2.SpatialReference()
+                    _srs2.ImportFromWkt(raster_crs_wkt)
+                    epsg_str = _srs2.GetAuthorityCode(None)
+                    if epsg_str:
+                        work_epsg = int(epsg_str)
                 except Exception:
                     pass
 
@@ -686,61 +709,81 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         except OSError:
             pass
 
-        feedback.pushInfo(self.tr("Esqueleto gravado. A vectorizar via rasterio.features + geopandas (streaming)..."))
+        feedback.pushInfo(self.tr("Esqueleto gravado. A vectorizar via rasterio.features + GDAL/OGR (streaming)..."))
 
         # ── VECTORIZAÇÃO DO ESQUELETO ───────────────────────────────────
         #
-        # USA rasterio.features.shapes() + GeoPandas — SEM Fiona directamente.
-        # O Fiona instalado fora do OSGeo4W pode ter conflito de proj.db,
-        # causando "PROJ: proj_create_from_database: DATABASE.LAYOUT.VERSION".
-        # O GeoPandas usa o GDAL/PROJ do OSGeo4W internamente (via pyogrio),
-        # pelo que não sofre deste conflito.
+        # PROBLEMA com pyproj instalado via pip fora do OSGeo4W:
+        #   Qualquer chamada que passe "EPSG:XXXXX" ao GeoDataFrame
+        #   acaba em pyproj.CRS.from_user_input() — que falha com
+        #   "no database context specified" porque o pyproj do pip
+        #   não tem acesso ao proj.db do OSGeo4W.
         #
-        # Estratégia de memória:
-        #   • Ler o esqueleto em blocos de ~32 MB de linhas.
-        #   • rasterio_shapes() emite geometrias uma a uma (gerador).
-        #   • Acumular num batch de LineStrings simplificadas.
-        #   • A cada BATCH_SIZE features: criar um GeoDataFrame e fazer
-        #     append ao ficheiro .gpkg via to_file(mode="a").
-        #   • Libertar o batch e forçar gc antes do próximo bloco.
+        # SOLUÇÃO — usar GDAL/OGR directamente via osgeo.ogr + osgeo.osr:
+        #   • Estas bibliotecas são as do OSGeo4W — têm o contexto PROJ
+        #     correcto por definição (é o mesmo que o QGIS usa).
+        #   • O CRS é definido via osr.SpatialReference().ImportFromEPSG()
+        #     ou ImportFromWkt() — sem passar pelo pyproj do pip.
+        #   • As geometrias são escritas feature a feature com ogr.Feature,
+        #     em batches com Flush() periódico.
+        #   • Estratégia de memória igual à anterior: blocos de ~32 MB,
+        #     flush a cada BATCH_SIZE features, gc.collect() após cada flush.
         # ---------------------------------------------------------------
         from rasterio.features import shapes as rasterio_shapes
-        from shapely.geometry import shape as shapely_shape
+        from shapely.geometry  import shape as shapely_shape
+        from osgeo             import ogr, osr
 
         temp_central_path = os.path.join(tmp, "temp_central.gpkg")
-        first_batch = True   # controla se o gpkg é criado ou feito append
 
+        # ── Definir SRS via OSR (usa o PROJ do OSGeo4W, não o do pip) ──
+        srs = osr.SpatialReference()
+        srs_ok = False
+        if work_epsg:
+            ret = srs.ImportFromEPSG(work_epsg)
+            srs_ok = (ret == 0)
+        if not srs_ok:
+            # Fallback: WKT do QGIS
+            try:
+                ret = srs.ImportFromWkt(work_crs_qgs.toWkt())
+                srs_ok = (ret == 0)
+            except Exception:
+                pass
+        if not srs_ok:
+            feedback.pushWarning(self.tr(
+                "Nao foi possivel definir o SRS para o ficheiro central. "
+                "O ficheiro sera gravado sem SRC definido."
+            ))
+            srs = None
+
+        # ── Criar datasource GPKG e layer ──────────────────────────────
+        drv     = ogr.GetDriverByName("GPKG")
+        ds_cent = drv.CreateDataSource(temp_central_path)
+        lyr     = ds_cent.CreateLayer(
+            "central_routes",
+            srs=srs,
+            geom_type=ogr.wkbLineString,
+        )
+        field_def = ogr.FieldDefn("source", ogr.OFTString)
+        field_def.SetWidth(32)
+        lyr.CreateField(field_def)
+        lyr_defn = lyr.GetLayerDefn()
+
+        # ── Ler esqueleto em blocos e gravar feature a feature ─────────
         with rasterio.open(temp_skel_path) as src:
             skel_transform = src.transform
-            skel_crs       = src.crs
             skel_height    = src.height
             skel_width     = src.width
             pixel_size     = abs(skel_transform.a)
 
-            simplify_tol   = pixel_size * 1.0   # 1 pixel de tolerância
+        simplify_tol   = pixel_size * 1.0
+        rows_per_block = max(1, min(skel_height, (32 * 1024 * 1024) // max(skel_width, 1)))
+        n_blocks       = math.ceil(skel_height / rows_per_block)
+        BATCH_SIZE     = 20_000
+        feat_count     = 0
 
-            rows_per_block = max(1, min(skel_height, (32 * 1024 * 1024) // max(skel_width, 1)))
-            n_blocks       = math.ceil(skel_height / rows_per_block)
+        lyr.StartTransaction()
 
-            BATCH_SIZE = 20_000   # features por flush (conservador para não encher RAM)
-            geom_batch = []
-
-            def _flush_batch(geom_list, path, crs_epsg, is_first):
-                """Grava uma lista de geometrias Shapely num .gpkg via GeoPandas."""
-                if not geom_list:
-                    return is_first
-                gdf = gpd.GeoDataFrame(
-                    {"source": ["central"] * len(geom_list)},
-                    geometry=geom_list,
-                    crs=f"EPSG:{crs_epsg}" if crs_epsg else None,
-                )
-                mode   = "w" if is_first else "a"
-                layer  = "central_routes"
-                gdf.to_file(path, driver="GPKG", layer=layer, mode=mode)
-                del gdf
-                gc.collect()
-                return False   # já não é o primeiro batch
-
+        with rasterio.open(temp_skel_path) as src:
             for i, row_off in enumerate(range(0, skel_height, rows_per_block)):
                 actual_rows     = min(rows_per_block, skel_height - row_off)
                 window          = rasterio.windows.Window(0, row_off, skel_width, actual_rows)
@@ -759,28 +802,41 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     line = geom.boundary.simplify(simplify_tol, preserve_topology=False)
                     if line.is_empty:
                         continue
-                    parts = list(line.geoms) if line.geom_type == "MultiLineString" else [line]
+                    parts = (
+                        list(line.geoms)
+                        if line.geom_type == "MultiLineString"
+                        else [line]
+                    )
                     for part in parts:
-                        if not part.is_empty and part.length > 0:
-                            geom_batch.append(part)
+                        if part.is_empty or part.length == 0:
+                            continue
+                        ogr_geom = ogr.CreateGeometryFromWkt(part.wkt)
+                        if ogr_geom is None:
+                            continue
+                        feat = ogr.Feature(lyr_defn)
+                        feat.SetGeometry(ogr_geom)
+                        feat.SetField("source", "central")
+                        lyr.CreateFeature(feat)
+                        feat  = None
+                        feat_count += 1
 
-                    if len(geom_batch) >= BATCH_SIZE:
-                        first_batch = _flush_batch(geom_batch, temp_central_path, work_epsg, first_batch)
-                        geom_batch.clear()
+                    if feat_count % BATCH_SIZE == 0:
+                        lyr.CommitTransaction()
+                        lyr.StartTransaction()
                         gc.collect()
 
                 del block
                 gc.collect()
-                feedback.setProgress(50 + int((i + 1) / n_blocks * 8))  # 50-58%
+                feedback.setProgress(50 + int((i + 1) / n_blocks * 8))
                 if feedback.isCanceled():
+                    lyr.CommitTransaction()
+                    ds_cent = None
                     return {}
 
-            # Flush final
-            first_batch = _flush_batch(geom_batch, temp_central_path, work_epsg, first_batch)
-            geom_batch.clear()
-
-        del geom_batch
+        lyr.CommitTransaction()
+        ds_cent = None   # fecha e grava o ficheiro
         gc.collect()
+        feedback.pushInfo(self.tr(f"Vectorizacao concluida: {feat_count} segmentos gravados."))
         feedback.setProgress(58)
 
         # Dissolver linhas contíguas (reduz número de features e melhora topologia)
