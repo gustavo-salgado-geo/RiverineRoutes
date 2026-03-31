@@ -904,35 +904,151 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgress(65)
 
         # ── C. ROTAS TRANSVERSAIS ───────────────────────────────────────
-        feedback.pushInfo(self.tr("A gerar rotas transversais (Transectos)..."))
+        #
+        # PROBLEMA com native:transect:
+        #   • O parâmetro DISTANCE opera sobre cada segmento elementar da
+        #     geometria, não sobre o comprimento total da linha. Após o
+        #     dissolve, o esqueleto é uma MultiLineString com milhares de
+        #     segmentos pequenos — o resultado é transectos a cada ~pixel,
+        #     não a cada TRANSECT_INTERVAL metros.
+        #   • O comprimento é fixo (LENGTH), não chega à margem real.
+        #
+        # SOLUÇÃO — implementação própria em Shapely:
+        #   1. Iterar sobre todas as geometrias da rota central.
+        #   2. Para cada geometry, percorrer o comprimento total em passos
+        #      de TRANSECT_INTERVAL metros usando interpolate().
+        #   3. Em cada ponto, calcular a direcção tangente da linha e
+        #      gerar uma perpendicular longa (2× a largura do rio).
+        #   4. Intersectar a perpendicular com o polígono da máscara
+        #      de água para obter o segmento exacto dentro do rio.
+        #   5. Gravar via OGR (sem aceder ao proj.db).
+        # ---------------------------------------------------------------
+        feedback.pushInfo(self.tr("A gerar rotas transversais (implementacao Shapely)..."))
 
-        transects = processing.run(
-            "native:transect",
-            {
-                "INPUT":    central_routes,
-                "LENGTH":   nav_mediana * 1.5,
-                "DISTANCE": transect_interval_m,
-                "SIDE":     2,
-                "OUTPUT":   "TEMPORARY_OUTPUT",
-            },
-            context=context,
-            feedback=feedback,
-        )["OUTPUT"]
-        feedback.setProgress(75)
+        from rasterio.features  import shapes as rasterio_shapes
+        from shapely.geometry   import LineString as ShpLineString, MultiLineString
+        from shapely.ops        import unary_union
+        from shapely.affinity   import rotate
+        from qgis.core          import QgsVectorLayer as _QgsVL
 
-        clipped_transects = processing.run(
-            "native:clip",
-            {
-                "INPUT":   transects,
-                "OVERLAY": vector_path,
-                "OUTPUT":  "TEMPORARY_OUTPUT",
-            },
-            context=context,
-            feedback=feedback,
-        )["OUTPUT"]
+        # Carregar a rota central como GeoDataFrame (já em memória QGIS)
+        if isinstance(central_routes, str):
+            cent_gdf = gpd.read_file(central_routes)
+        else:
+            # É uma camada QGIS em memória — exportar para gpkg temporário
+            temp_cent_exp = os.path.join(tmp, "cent_export.gpkg")
+            processing.run("native:savefeatures", {
+                "INPUT": central_routes, "OUTPUT": temp_cent_exp,
+            }, context=context, feedback=feedback)
+            cent_gdf = gpd.read_file(temp_cent_exp)
 
-        del transects
+        # Carregar o polígono da máscara de água para clip
+        water_mask_gdf = _read_vector(vector_path)[["geometry"]]
+        water_union    = water_mask_gdf.geometry.unary_union
+        del water_mask_gdf
+
+        # Estimar a largura máxima do rio para o comprimento da perpendicular
+        # (usa a bbox do polígono de água como estimativa conservadora)
+        water_bbox_diag = (
+            (water_union.bounds[2] - water_union.bounds[0]) ** 2
+            + (water_union.bounds[3] - water_union.bounds[1]) ** 2
+        ) ** 0.5
+        perp_half_len = min(water_bbox_diag, nav_mediana * 10)
+
+        # Criar datasource OGR para os transectos
+        temp_transect_path = os.path.join(tmp, "temp_transects.gpkg")
+        drv_t   = ogr.GetDriverByName("GPKG")
+        ds_t    = drv_t.CreateDataSource(temp_transect_path)
+        srs_t   = osr.SpatialReference()
+        srs_t.ImportFromWkt(work_crs_qgs.toWkt())
+        lyr_t   = ds_t.CreateLayer("transects", srs=srs_t, geom_type=ogr.wkbLineString)
+        fdef_t  = ogr.FieldDefn("source", ogr.OFTString)
+        fdef_t.SetWidth(32)
+        lyr_t.CreateField(fdef_t)
+        lyr_defn_t = lyr_t.GetLayerDefn()
+        lyr_t.StartTransaction()
+        t_count = 0
+
+        def _make_perpendicular(line_geom, dist_along, half_len):
+            """
+            Cria uma perpendicular à linha no ponto a dist_along do início.
+            Usa dois pontos próximos para estimar a tangente local.
+            Devolve um ShpLineString longo o suficiente para cruzar o rio,
+            ou None se não for possível calcular a tangente.
+            """
+            delta = max(0.1, half_len * 0.001)   # incremento para tangente
+            p0 = line_geom.interpolate(max(0.0, dist_along - delta))
+            p1 = line_geom.interpolate(min(line_geom.length, dist_along + delta))
+            dx = p1.x - p0.x
+            dy = p1.y - p0.y
+            norm = (dx**2 + dy**2) ** 0.5
+            if norm < 1e-10:
+                return None
+            # Perpendicular: rodar 90° → (-dy, dx)
+            px, py = -dy / norm, dx / norm
+            cx = line_geom.interpolate(dist_along).x
+            cy = line_geom.interpolate(dist_along).y
+            return ShpLineString([
+                (cx - px * half_len, cy - py * half_len),
+                (cx + px * half_len, cy + py * half_len),
+            ])
+
+        total_geoms = len(cent_gdf)
+        for gi, row in enumerate(cent_gdf.itertuples()):
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+            # Explodir MultiLineString em linhas simples
+            parts = (
+                list(geom.geoms)
+                if geom.geom_type == "MultiLineString"
+                else [geom]
+            )
+            for part in parts:
+                length = part.length
+                if length < transect_interval_m:
+                    continue
+                dist = 0.0
+                while dist <= length:
+                    perp = _make_perpendicular(part, dist, perp_half_len)
+                    if perp is not None:
+                        # Clipar com o polígono de água
+                        clipped = perp.intersection(water_union)
+                        if not clipped.is_empty and clipped.length > 1.0:
+                            segs = (
+                                list(clipped.geoms)
+                                if clipped.geom_type in ("MultiLineString", "GeometryCollection")
+                                else [clipped]
+                            )
+                            for seg in segs:
+                                if seg.geom_type == "LineString" and seg.length > 1.0:
+                                    ogr_g = ogr.CreateGeometryFromWkt(seg.wkt)
+                                    if ogr_g:
+                                        feat_t = ogr.Feature(lyr_defn_t)
+                                        feat_t.SetGeometry(ogr_g)
+                                        feat_t.SetField("source", "transversal")
+                                        lyr_t.CreateFeature(feat_t)
+                                        feat_t = None
+                                        t_count += 1
+                    dist += transect_interval_m
+
+                    if t_count % 500 == 0 and t_count > 0:
+                        lyr_t.CommitTransaction()
+                        lyr_t.StartTransaction()
+                        gc.collect()
+
+            feedback.setProgress(65 + int((gi + 1) / max(total_geoms, 1) * 17))
+            if feedback.isCanceled():
+                lyr_t.CommitTransaction()
+                ds_t = None
+                return {}
+
+        lyr_t.CommitTransaction()
+        ds_t = None
         gc.collect()
+
+        feedback.pushInfo(self.tr(f"Transversais concluidas: {t_count} rotas geradas."))
+        clipped_transects = temp_transect_path
         feedback.setProgress(82)
 
         # ── D. MESCLAR REDES ────────────────────────────────────────────
