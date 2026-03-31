@@ -16,6 +16,9 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsProject,
+    QgsFeatureSink,
+    QgsVectorLayer,
+    QgsFeature,
 )
 
 import geopandas as gpd
@@ -966,51 +969,70 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         gc.collect()
         feedback.setProgress(90)
 
-        # ── E. REPROJETAR SAÍDA ────────────────────────────────────────
+        # ── E. REPROJETAR PARA O SRC DE SAÍDA (TEMPORARY_OUTPUT) ────────
+        # O native:reprojectlayer com destino ficheiro preserva os FIDs
+        # originais — quando há features de 3 camadas mescladas os FIDs
+        # ficam duplicados e o GPKG falha com "UNIQUE constraint failed: fid".
+        # Solução: reprojetar sempre para TEMPORARY_OUTPUT (camada em memória).
+        # O destino final é controlado pelo OUTPUT_NETWORK do Processing,
+        # que atribui FIDs novos e sequenciais automaticamente.
+
         if output_crs_param and output_crs_param.isValid():
-            out_epsg = output_crs_param.postgisSrid()
-            feedback.pushInfo(
-                self.tr(f"A reprojetar a rede final para EPSG:{out_epsg}...")
-            )
-
-            output_path = parameters[self.OUTPUT_NETWORK]
-
-            if not str(output_path).lower().endswith(".gpkg"):
-                output_path = str(output_path) + ".gpkg"
-
-            final_network = processing.run(
-                "native:reprojectlayer",
-                {
-                    "INPUT": merged_network,
-                    "TARGET_CRS": output_crs_param,
-                    "OUTPUT": output_path,
-                },
-                context=context,
-                feedback=feedback,
-            )["OUTPUT"]
-
+            target_crs  = output_crs_param
+            target_desc = output_crs_param.authid()
         else:
-            feedback.pushInfo(
-                self.tr(
-                    f"Nenhum SRC de saida definido. "
-                    f"Rede gerada no SRC de processamento (EPSG:{work_epsg})."
-                )
-            )
+            target_crs  = work_crs_qgs
+            target_desc = work_crs_qgs.authid()
 
-            final_path = os.path.join(tmp, "final_network.gpkg")
+        feedback.pushInfo(self.tr(f"A reprojetar a rede final para {target_desc}..."))
 
-            final_network = processing.run(
-                "native:reprojectlayer",
-                {
-                    "INPUT": merged_network,
-                    "TARGET_CRS": work_crs_qgs,
-                    "OUTPUT": final_path,
-                },
-                context=context,
-                feedback=feedback,
-            )["OUTPUT"]
+        reprojected = processing.run(
+            "native:reprojectlayer",
+            {
+                "INPUT":      merged_network,
+                "TARGET_CRS": target_crs,
+                "OUTPUT":     "TEMPORARY_OUTPUT",   # evita FIDs duplicados no GPKG
+            },
+            context=context,
+            feedback=feedback,
+        )["OUTPUT"]
 
+        del merged_network
+        gc.collect()
+        feedback.setProgress(95)
+
+        # ── F. GRAVAR NA SAÍDA FINAL VIA FEATURESINK ──────────────────
+        # O FeatureSink do QGIS Processing gere os FIDs automaticamente,
+        # garantindo unicidade independentemente do formato de saída
+        # (GPKG, SHP, GeoJSON, memória, etc.).
+        feedback.pushInfo(self.tr("A gravar a rede final..."))
+
+        # Abrir a camada reprojetada
+        if isinstance(reprojected, str):
+            lyr_final = QgsVectorLayer(reprojected, "rede_final", "ogr")
+        else:
+            lyr_final = reprojected   # já é QgsVectorLayer (TEMPORARY_OUTPUT)
+
+        (sink, dest_id) = self.parameterAsSink(
+            parameters, self.OUTPUT_NETWORK, context,
+            lyr_final.fields(), lyr_final.wkbType(), lyr_final.crs()
+        )
+
+        if sink is None:
+            feedback.reportError(self.tr("Nao foi possivel criar a camada de saida."), fatalError=True)
+            return {}
+
+        total = lyr_final.featureCount()
+        for n, feat in enumerate(lyr_final.getFeatures()):
+            sink.addFeature(feat, QgsFeatureSink.FastInsert)
+            if n % 5000 == 0:
+                feedback.setProgress(95 + int(n / max(total, 1) * 5))
+            if feedback.isCanceled():
+                return {}
+
+        del sink, lyr_final
+        gc.collect()
         feedback.setProgress(100)
         feedback.pushInfo(self.tr("Rede fluvial concluida com sucesso."))
 
-        return {self.OUTPUT_NETWORK: final_network}
+        return {self.OUTPUT_NETWORK: dest_id}
