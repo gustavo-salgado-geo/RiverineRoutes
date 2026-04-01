@@ -1054,26 +1054,46 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     visited[grp_rows[0], grp_cols[0]] = True
                     continue
 
-                # Ponto de arranque: primeiro pixel do grupo
+                # Ponto de arranque: pixel da extremidade do grupo
+                # (pixel com menor número de vizinhos no grupo = terminal)
+                # Isto garante que o rastreio começa numa ponta, não no meio.
                 sr2, sc2 = int(grp_rows[0]), int(grp_cols[0])
-
-                # Mini-rastreio dentro do grupo
-                chain2 = []
-                stack  = [(sr2, sc2)]
-                v2     = np.zeros_like(skel_arr, dtype=bool)
-
-                while stack:
-                    cr, cc = stack.pop()
-                    if v2[cr, cc]:
-                        continue
-                    v2[cr, cc]      = True
-                    visited[cr, cc] = True
-                    chain2.append((cr, cc))
+                best_start_n = 9
+                for ri, ci in zip(grp_rows.tolist(), grp_cols.tolist()):
+                    n_nb = 0
                     for dr, dc in NEIGHBORS_8:
-                        nr2, nc2 = cr + dr, cc + dc
+                        nr2_, nc2_ = ri+dr, ci+dc
+                        if 0 <= nr2_ < skel_arr.shape[0] and 0 <= nc2_ < skel_arr.shape[1]:
+                            if grp_mask[nr2_, nc2_]:
+                                n_nb += 1
+                    if n_nb < best_start_n:
+                        best_start_n = n_nb
+                        sr2, sc2 = int(ri), int(ci)
+                    if best_start_n == 1:
+                        break  # terminal encontrado — não há melhor arranque
+
+                # Rastreio em cadeia ordenada (segue vizinhos um a um)
+                # DIFERENTE do DFS: usa fila de 1 elemento, sempre seguindo
+                # o próximo vizinho não visitado. Gera coords em ordem espacial.
+                chain2 = []
+                v2     = np.zeros(skel_arr.shape, dtype=bool)
+                cur_r2, cur_c2 = sr2, sc2
+
+                while True:
+                    v2[cur_r2, cur_c2]      = True
+                    visited[cur_r2, cur_c2] = True
+                    chain2.append((cur_r2, cur_c2))
+                    # Procurar próximo vizinho não visitado dentro do grupo
+                    next_r2, next_c2 = -1, -1
+                    for dr, dc in NEIGHBORS_8:
+                        nr2, nc2 = cur_r2+dr, cur_c2+dc
                         if 0 <= nr2 < skel_arr.shape[0] and 0 <= nc2 < skel_arr.shape[1]:
-                            if skel_arr[nr2, nc2] and not v2[nr2, nc2]:
-                                stack.append((nr2, nc2))
+                            if grp_mask[nr2, nc2] and not v2[nr2, nc2]:
+                                next_r2, next_c2 = nr2, nc2
+                                break
+                    if next_r2 == -1:
+                        break  # fim da cadeia
+                    cur_r2, cur_c2 = next_r2, next_c2
 
                 if len(chain2) >= 2:
                     lines_rc.append(chain2)
@@ -1120,37 +1140,22 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         simplify_tol = pixel_size * 1.0
         shapely_lines = []
 
-        feedback.pushInfo(self.tr("  Convertendo cadeias para LineStrings (sem Chaikin)..."))
+        feedback.pushInfo(self.tr("  Convertendo cadeias para LineStrings..."))
         for chain in lines_rc:
             if len(chain) < 2:
                 continue
 
-            # Ordenar pixels da cadeia por proximidade ao vizinho anterior
-            # (resolve o problema do DFS desordenado da segunda passagem)
-            ordered = [chain[0]]
-            remaining = list(chain[1:])
-            while remaining:
-                cr, cc = ordered[-1]
-                # Encontrar o pixel mais próximo (distância de Chebyshev)
-                best_i = 0
-                best_d = float("inf")
-                for idx, (nr, nc_) in enumerate(remaining):
-                    d = max(abs(nr - cr), abs(nc_ - cc))
-                    if d < best_d:
-                        best_d = d
-                        best_i = idx
-                ordered.append(remaining.pop(best_i))
-
-            coords = [_rc_to_xy(r, c) for r, c in ordered]
+            # As cadeias da primeira passagem já estão ordenadas spatialmente.
+            # As cadeias da segunda passagem agora também (rastreio em cadeia).
+            # Conversão directa O(n) — sem nearest-neighbour sort.
+            coords = [_rc_to_xy(r, c) for r, c in chain]
             if len(coords) < 2:
                 continue
 
             line = ShpLineString(coords).simplify(simplify_tol, preserve_topology=True)
             if line.is_empty or line.length == 0:
                 continue
-            # Não aplicar Chaikin — o simplify já é suficiente e é seguro
-            if not line.is_empty and line.length > 0:
-                shapely_lines.append(line)
+            shapely_lines.append(line)
 
         del lines_rc
         gc.collect()
