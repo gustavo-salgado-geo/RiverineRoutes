@@ -348,6 +348,45 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
     # ------------------------------------------------------------------
     def processAlgorithm(self, parameters, context, feedback):
 
+        # ── 0. FIXAR PROJ_DATA para o OSGeo4W — DEVE SER O PRIMEIRO PASSO
+        #
+        # O GDAL/OGR e o OSR usam o PROJ para resolver CRSs. Quando há
+        # múltiplas instalações do PROJ no sistema (OSGeo4W + pip + Anaconda),
+        # o GDAL pode encontrar um proj.db de versão errada e falhar com
+        # "no database context specified" ou "Cannot parse CRS".
+        #
+        # Solução: forçar PROJ_DATA (e o alias PROJ_LIB) para o caminho
+        # do OSGeo4W ANTES de qualquer chamada GDAL/OGR/OSR.
+        # O caminho é detectado a partir da localização do gdal.py do OSGeo4W.
+        # ---------------------------------------------------------------
+        import os as _os
+        try:
+            from osgeo import gdal as _gdal_probe, osr as _osr_probe
+            # Determinar a pasta do OSGeo4W a partir do caminho do gdal.py
+            _gdal_path = _gdal_probe.__file__                  # ex: C:\...\OSGeo4W\...\gdal.py
+            _osgeo4w_root = _gdal_path
+            for _ in range(6):                                 # subir até 6 níveis
+                _osgeo4w_root = _os.path.dirname(_osgeo4w_root)
+                _proj_db_candidate = _os.path.join(_osgeo4w_root, "share", "proj", "proj.db")
+                if _os.path.isfile(_proj_db_candidate):
+                    _proj_data_dir = _os.path.join(_osgeo4w_root, "share", "proj")
+                    _os.environ["PROJ_DATA"] = _proj_data_dir
+                    _os.environ["PROJ_LIB"]  = _proj_data_dir  # alias legacy
+                    # Reinicializar o contexto PROJ do OSR
+                    try:
+                        _osr_probe.SetPROJSearchPaths([_proj_data_dir])
+                    except Exception:
+                        pass
+                    feedback.pushInfo(self.tr(f"PROJ_DATA fixado: {_proj_data_dir}"))
+                    break
+            else:
+                feedback.pushWarning(self.tr(
+                    "Nao foi possivel localizar o proj.db do OSGeo4W automaticamente. "
+                    "Se ocorrerem erros de CRS, defina a variavel PROJ_DATA manualmente."
+                ))
+        except Exception as _e_proj:
+            feedback.pushWarning(self.tr(f"Aviso ao fixar PROJ_DATA: {_e_proj}"))
+
         # ── 1. Recuperar parâmetros ─────────────────────────────────────
         raster_layer  = self.parameterAsRasterLayer(parameters, self.INPUT_RASTER, context)
         vector_layer  = self.parameterAsVectorLayer(parameters, self.INPUT_VECTOR, context)
@@ -1442,139 +1481,182 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         # ── C. ROTAS TRANSVERSAIS ───────────────────────────────────────
         #
-        # PROBLEMA com native:transect:
-        #   • O parâmetro DISTANCE opera sobre cada segmento elementar da
-        #     geometria, não sobre o comprimento total da linha. Após o
-        #     dissolve, o esqueleto é uma MultiLineString com milhares de
-        #     segmentos pequenos — o resultado é transectos a cada ~pixel,
-        #     não a cada TRANSECT_INTERVAL metros.
-        #   • O comprimento é fixo (LENGTH), não chega à margem real.
+        # PROBLEMAS da versão anterior:
+        #   1. DENSIFICAÇÃO: o cent_gdf lido do .gpkg continha segmentos
+        #      individuais curtos. O loop gerava transversais a cada
+        #      TRANSECT_INTERVAL de CADA segmento — não do canal total.
+        #      Solução: fazer linemerge das geometrias antes de gerar
+        #      transversais, para operar sobre linhas contínuas.
         #
-        # SOLUÇÃO — implementação própria em Shapely:
-        #   1. Iterar sobre todas as geometrias da rota central.
-        #   2. Para cada geometry, percorrer o comprimento total em passos
-        #      de TRANSECT_INTERVAL metros usando interpolate().
-        #   3. Em cada ponto, calcular a direcção tangente da linha e
-        #      gerar uma perpendicular longa (2× a largura do rio).
-        #   4. Intersectar a perpendicular com o polígono da máscara
-        #      de água para obter o segmento exacto dentro do rio.
-        #   5. Gravar via OGR (sem aceder ao proj.db).
+        #   2. COMPRIMENTO INSUFICIENTE: perp_half_len era estimado pela
+        #      bbox do polígono ou nav_mediana×10, sem relação com a
+        #      largura real do rio no ponto. A perpendicular não alcançava
+        #      a margem em rios largos ou ângulos oblíquos.
+        #      Solução: usar a distância do ponto central ao limite do
+        #      polígono de água multiplicada por 2, com mínimo garantido.
+        #
+        #   3. CLIP INCOMPLETO: segs com geom_type != "LineString" eram
+        #      descartados. Um clip pode devolver LinearRing ou outros.
+        #      Solução: tentar extrair coordenadas de qualquer geometria.
         # ---------------------------------------------------------------
-        feedback.pushInfo(self.tr("A gerar rotas transversais (implementacao Shapely)..."))
+        feedback.pushInfo(self.tr("A gerar rotas transversais..."))
 
-        from rasterio.features  import shapes as rasterio_shapes
-        from shapely.geometry   import LineString as ShpLineString, MultiLineString
-        from shapely.ops        import unary_union
-        from shapely.affinity   import rotate
-        from qgis.core          import QgsVectorLayer as _QgsVL
+        from shapely.geometry import LineString as ShpLineString, MultiLineString
+        from shapely.ops      import linemerge as shp_linemerge2, unary_union as shp_union2
+        from shapely          import wkt as shp_wkt_mod
 
-        # Carregar a rota central como GeoDataFrame (já em memória QGIS)
-        if isinstance(central_routes, str):
-            cent_gdf = gpd.read_file(central_routes)
+        # ── Carregar e fazer linemerge das rotas centrais ───────────────
+        # IMPORTANTE: ler as geometrias do .gpkg e fazer linemerge para
+        # obter linhas contínuas. Sem isto, o loop itera sobre fragmentos
+        # curtos e gera transversais com densidade errada.
+        feedback.pushInfo(self.tr("  Carregando e unindo rotas centrais para transversais..."))
+        raw_central_lines = []
+        ds_c = ogr.Open(central_routes)
+        lyr_c = ds_c.GetLayer(0)
+        for feat_c in lyr_c:
+            geom_c = feat_c.GetGeometryRef()
+            if geom_c is None:
+                continue
+            try:
+                g = shp_wkt_mod.loads(geom_c.ExportToWkt())
+                if g and not g.is_empty:
+                    if g.geom_type == "MultiLineString":
+                        raw_central_lines.extend(list(g.geoms))
+                    elif g.geom_type == "LineString":
+                        raw_central_lines.append(g)
+            except Exception:
+                pass
+        ds_c = None
+
+        merged_central = shp_linemerge2(raw_central_lines)
+        del raw_central_lines
+        gc.collect()
+
+        if merged_central.geom_type == "LineString":
+            central_line_list = [merged_central]
+        elif merged_central.geom_type == "MultiLineString":
+            central_line_list = list(merged_central.geoms)
         else:
-            # É uma camada QGIS em memória — exportar para gpkg temporário
-            temp_cent_exp = os.path.join(tmp, "cent_export.gpkg")
-            processing.run("native:savefeatures", {
-                "INPUT": central_routes, "OUTPUT": temp_cent_exp,
-            }, context=context, feedback=feedback)
-            cent_gdf = gpd.read_file(temp_cent_exp)
+            central_line_list = [g for g in getattr(merged_central, "geoms", [])
+                                 if g.geom_type == "LineString"]
 
-        # Carregar o polígono da máscara de água para clip
+        feedback.pushInfo(self.tr(
+            f"  {len(central_line_list)} linhas centrais continuas para transversais."
+        ))
+
+        # ── Carregar polígono de água ────────────────────────────────────
         water_mask_gdf = _read_vector(vector_path)[["geometry"]]
         water_union    = water_mask_gdf.geometry.unary_union
         del water_mask_gdf
+        gc.collect()
 
-        # Estimar a largura máxima do rio para o comprimento da perpendicular
-        # (usa a bbox do polígono de água como estimativa conservadora)
-        water_bbox_diag = (
-            (water_union.bounds[2] - water_union.bounds[0]) ** 2
-            + (water_union.bounds[3] - water_union.bounds[1]) ** 2
-        ) ** 0.5
-        perp_half_len = min(water_bbox_diag, nav_mediana * 10)
-
-        # Criar datasource OGR para os transectos
+        # ── Criar datasource OGR ─────────────────────────────────────────
         temp_transect_path = os.path.join(tmp, "temp_transects.gpkg")
         drv_t   = ogr.GetDriverByName("GPKG")
         ds_t    = drv_t.CreateDataSource(temp_transect_path)
         srs_t   = osr.SpatialReference()
         srs_t.ImportFromWkt(work_crs_qgs.toWkt())
         lyr_t   = ds_t.CreateLayer("transects", srs=srs_t, geom_type=ogr.wkbLineString)
-        fdef_t  = ogr.FieldDefn("source", ogr.OFTString)
-        fdef_t.SetWidth(32)
+        fdef_t  = ogr.FieldDefn("source", ogr.OFTString); fdef_t.SetWidth(32)
         lyr_t.CreateField(fdef_t)
         lyr_defn_t = lyr_t.GetLayerDefn()
         lyr_t.StartTransaction()
         t_count = 0
 
-        def _make_perpendicular(line_geom, dist_along, half_len):
+        def _make_perpendicular_v2(line_geom, dist_along, water_poly):
             """
-            Cria uma perpendicular à linha no ponto a dist_along do início.
-            Usa dois pontos próximos para estimar a tangente local.
-            Devolve um ShpLineString longo o suficiente para cruzar o rio,
-            ou None se não for possível calcular a tangente.
+            Cria uma perpendicular correcta à linha no ponto dist_along.
+
+            Comprimento: calcula a distância do ponto central ao limite
+            do polígono de água (nearest point on boundary) e usa isso
+            como half_len, com um mínimo de 50m para canais estreitos.
+            Isto garante que a perpendicular SEMPRE alcança a margem.
             """
-            delta = max(0.1, half_len * 0.001)   # incremento para tangente
+            # Tangente local
+            total_len = line_geom.length
+            delta = max(1.0, total_len * 0.0005)
             p0 = line_geom.interpolate(max(0.0, dist_along - delta))
-            p1 = line_geom.interpolate(min(line_geom.length, dist_along + delta))
-            dx = p1.x - p0.x
-            dy = p1.y - p0.y
+            p1 = line_geom.interpolate(min(total_len, dist_along + delta))
+            dx, dy = p1.x - p0.x, p1.y - p0.y
             norm = (dx**2 + dy**2) ** 0.5
             if norm < 1e-10:
                 return None
-            # Perpendicular: rodar 90° → (-dy, dx)
+
+            # Centro da transversal
+            cp = line_geom.interpolate(dist_along)
+            cx, cy = cp.x, cp.y
+
+            # Distância do centro ao limite do polígono de água
+            from shapely.geometry import Point as ShpPoint
+            center_pt = ShpPoint(cx, cy)
+            boundary  = water_poly.boundary
+            dist_to_boundary = center_pt.distance(boundary)
+
+            # half_len = distância ao limite × 1.5 (margem de segurança)
+            # mínimo de 50 m para garantir que alcança sempre
+            half_len = max(50.0, dist_to_boundary * 1.5)
+
+            # Vector perpendicular (rotação 90°)
             px, py = -dy / norm, dx / norm
-            cx = line_geom.interpolate(dist_along).x
-            cy = line_geom.interpolate(dist_along).y
+
             return ShpLineString([
                 (cx - px * half_len, cy - py * half_len),
                 (cx + px * half_len, cy + py * half_len),
             ])
 
-        total_geoms = len(cent_gdf)
-        for gi, row in enumerate(cent_gdf.itertuples()):
-            geom = row.geometry
-            if geom is None or geom.is_empty:
+        total_lines = len(central_line_list)
+        for gi, line in enumerate(central_line_list):
+            if line is None or line.is_empty:
                 continue
-            # Explodir MultiLineString em linhas simples
-            parts = (
-                list(geom.geoms)
-                if geom.geom_type == "MultiLineString"
-                else [geom]
-            )
-            for part in parts:
-                length = part.length
-                if length < transect_interval_m:
-                    continue
-                dist = 0.0
-                while dist <= length:
-                    perp = _make_perpendicular(part, dist, perp_half_len)
-                    if perp is not None:
-                        # Clipar com o polígono de água
-                        clipped = perp.intersection(water_union)
-                        if not clipped.is_empty and clipped.length > 1.0:
-                            segs = (
-                                list(clipped.geoms)
-                                if clipped.geom_type in ("MultiLineString", "GeometryCollection")
-                                else [clipped]
-                            )
-                            for seg in segs:
-                                if seg.geom_type == "LineString" and seg.length > 1.0:
-                                    ogr_g = ogr.CreateGeometryFromWkt(seg.wkt)
-                                    if ogr_g:
-                                        feat_t = ogr.Feature(lyr_defn_t)
-                                        feat_t.SetGeometry(ogr_g)
-                                        feat_t.SetField("source", "transversal")
-                                        lyr_t.CreateFeature(feat_t)
-                                        feat_t = None
-                                        t_count += 1
-                    dist += transect_interval_m
 
-                    if t_count % 500 == 0 and t_count > 0:
-                        lyr_t.CommitTransaction()
-                        lyr_t.StartTransaction()
-                        gc.collect()
+            length = line.length
+            # Só gerar transversais em linhas com comprimento >= intervalo
+            if length < transect_interval_m:
+                continue
 
-            feedback.setProgress(65 + int((gi + 1) / max(total_geoms, 1) * 17))
+            # Distribuir pontos ao longo da linha, começando a meio do
+            # primeiro intervalo para não colocar transversais nas pontas
+            dist = transect_interval_m / 2.0
+            while dist < length:
+                perp = _make_perpendicular_v2(line, dist, water_union)
+                if perp is not None:
+                    clipped = perp.intersection(water_union)
+                    if not clipped.is_empty and clipped.length > 1.0:
+                        # Extrair todos os segmentos de linha do resultado do clip
+                        candidates = []
+                        if clipped.geom_type == "LineString":
+                            candidates = [clipped]
+                        elif clipped.geom_type in ("MultiLineString", "GeometryCollection"):
+                            candidates = [g for g in clipped.geoms
+                                         if hasattr(g, "coords") and g.length > 1.0]
+                        elif hasattr(clipped, "coords"):
+                            # LinearRing ou outro com coords
+                            try:
+                                candidates = [ShpLineString(list(clipped.coords))]
+                            except Exception:
+                                pass
+
+                        for seg in candidates:
+                            try:
+                                ogr_g = ogr.CreateGeometryFromWkt(seg.wkt)
+                            except Exception:
+                                ogr_g = None
+                            if ogr_g:
+                                feat_t = ogr.Feature(lyr_defn_t)
+                                feat_t.SetGeometry(ogr_g)
+                                feat_t.SetField("source", "transversal")
+                                lyr_t.CreateFeature(feat_t)
+                                feat_t = None
+                                t_count += 1
+
+                dist += transect_interval_m
+
+                if t_count % 500 == 0 and t_count > 0:
+                    lyr_t.CommitTransaction()
+                    lyr_t.StartTransaction()
+                    gc.collect()
+
+            feedback.setProgress(65 + int((gi + 1) / max(total_lines, 1) * 17))
             if feedback.isCanceled():
                 lyr_t.CommitTransaction()
                 ds_t = None
@@ -1582,6 +1664,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         lyr_t.CommitTransaction()
         ds_t = None
+        del central_line_list, water_union
         gc.collect()
 
         feedback.pushInfo(self.tr(f"Transversais concluidas: {t_count} rotas geradas."))
