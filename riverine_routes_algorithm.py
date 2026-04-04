@@ -986,88 +986,125 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 coords = nc
             return coords
 
-        # ── Rastreio: percorrer cada cadeia de pixels ───────────────────
-        # Estratégia:
-        #   • Marcar pixels visitados num array separado.
-        #   • Para cada pixel de arranque (terminal ou junção), percorrer
-        #     os vizinhos não visitados até atingir outro terminal/junção
-        #     ou um pixel sem saída.
-        #   • Cada cadeia completa → uma LineString.
+        # ── RASTREIO DE GRAFO EXPLÍCITO ─────────────────────────────────
+        #
+        # Abordagem anterior: rastreio sequencial que marcava pixels como
+        # visitados à medida que avançava. Problema: quando dois ramos
+        # chegavam à mesma junção, um deles chegava exactamente ao pixel
+        # de junção e o outro parava num pixel interno adjacente — os
+        # endpoints nunca eram o mesmo pixel, quebrando a topologia.
+        #
+        # Nova abordagem — grafo explícito nó→aresta:
+        #
+        #   PASSO 1: Identificar todos os NÓS = pixels terminais + junções.
+        #            Cada nó tem uma coordenada (x,y) exacta e única.
+        #
+        #   PASSO 2: Para cada nó, para cada vizinho não visitado:
+        #            Seguir a cadeia de pixels INTERNOS (n_vizinhos == 2)
+        #            até chegar a outro NÓ. A cadeia começa no nó de
+        #            origem e termina no nó de destino.
+        #            Marcar as ARESTAS como visitadas (não os nós).
+        #
+        #   PASSO 3: Cada aresta do grafo = uma lista de pixels ordenados
+        #            [nó_origem, interno_1, ..., interno_n, nó_destino].
+        #            Garantia: todas as arestas que chegam ao mesmo nó
+        #            terminam EXACTAMENTE nas mesmas coordenadas desse nó.
+        #
+        # Resultado: topologia correcta com nós partilhados por definição.
+        # ---------------------------------------------------------------
 
-        visited  = np.zeros_like(skel_arr, dtype=bool)
-        lines_rc = []   # lista de listas de (row, col)
-
-        # Offsets dos 8 vizinhos (Moore neighbourhood)
         NEIGHBORS_8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
 
-        def _get_active_neighbors(r, c):
+        def _all_neighbors(r, c):
+            """Todos os vizinhos 8-conexos activos (visitados ou não)."""
             nb = []
             for dr, dc in NEIGHBORS_8:
                 nr, nc_ = r+dr, c+dc
                 if 0 <= nr < skel_arr.shape[0] and 0 <= nc_ < skel_arr.shape[1]:
-                    if skel_arr[nr, nc_] and not visited[nr, nc_]:
+                    if skel_arr[nr, nc_]:
                         nb.append((nr, nc_))
             return nb
 
-        # Pontos de arranque: terminais primeiro, depois junções
-        start_mask = terminals | junctions
-        start_rows, start_cols = np.where(start_mask)
+        # Conjunto de nós: pixels terminais ou de junção
+        node_mask = terminals | junctions
 
-        # Se não há terminais/junções (linha circular fechada), usar qualquer pixel
-        if len(start_rows) == 0:
-            start_rows, start_cols = np.where(skel_arr)
+        # Conjunto de arestas já percorridas: chave = frozenset({(r1,c1),(r2,c2)})
+        # para o primeiro e último pixel de cada aresta
+        visited_edges = set()
 
-        total_starts = len(start_rows)
-        for si, (sr, sc) in enumerate(zip(start_rows, start_cols)):
-            if visited[sr, sc]:
-                continue
+        lines_rc = []
 
-            # Percorrer cada ramo saindo deste ponto de arranque
-            neighbors = _get_active_neighbors(sr, sc)
-            if not neighbors and not visited[sr, sc]:
-                # Pixel isolado (já podado mas ficou) — ignorar
-                visited[sr, sc] = True
-                continue
+        node_rows, node_cols = np.where(node_mask)
+        total_nodes = len(node_rows)
 
-            visited[sr, sc] = True
-
-            for (nr, nc_) in neighbors:
-                if visited[nr, nc_]:
+        for ni, (nr0, nc0) in enumerate(zip(node_rows, node_cols)):
+            # Para cada vizinho deste nó, tentar percorrer uma aresta
+            for (vr, vc) in _all_neighbors(nr0, nc0):
+                edge_key = (min((nr0,nc0),(vr,vc)), max((nr0,nc0),(vr,vc)))
+                if edge_key in visited_edges:
                     continue
-                # Seguir a cadeia
-                chain = [(sr, sc), (nr, nc_)]
-                visited[nr, nc_] = True
-                cur_r, cur_c = nr, nc_
 
+                # Percorrer a aresta: começar no nó (nr0,nc0),
+                # entrar no vizinho (vr,vc) e seguir internos até ao próximo nó
+                chain = [(nr0, nc0), (vr, vc)]
+                visited_edges.add(edge_key)
+
+                cur_r, cur_c = vr, vc
+
+                # Se o vizinho já é um nó, a aresta tem apenas 2 pixels
+                if node_mask[cur_r, cur_c]:
+                    if len(chain) >= 2:
+                        lines_rc.append(chain)
+                    continue
+
+                # Seguir pixels internos até ao próximo nó
+                prev_r, prev_c = nr0, nc0
                 while True:
-                    nbs = _get_active_neighbors(cur_r, cur_c)
+                    # Vizinhos activos excluindo o pixel anterior
+                    nbs = [(r, c) for r, c in _all_neighbors(cur_r, cur_c)
+                           if (r, c) != (prev_r, prev_c)]
+
                     if not nbs:
+                        # Beco sem saída — terminar aqui
                         break
-                    if len(nbs) > 1:
-                        # O pixel ACTUAL (cur_r, cur_c) tem múltiplos vizinhos
-                        # não visitados — ele próprio é uma junção ou está
-                        # adjacente a uma. O ponto de chegada desta cadeia
-                        # deve ser o pixel ACTUAL, que já está na chain.
-                        # Não adicionar nenhum vizinho extra.
-                        # O pixel actual JÁ ESTÁ marcado como visitado, por isso
-                        # será o ponto de arranque das cadeias seguintes apenas
-                        # se for uma junção (está em start_mask).
-                        break
-                    next_r, next_c = nbs[0]
-                    chain.append((next_r, next_c))
-                    visited[next_r, next_c] = True
-                    cur_r, cur_c = next_r, next_c
-                    # Parar se chegou a terminal ou junção
-                    if terminals[cur_r, cur_c] or junctions[cur_r, cur_c]:
+
+                    if len(nbs) == 1:
+                        next_r, next_c = nbs[0]
+                        e2 = (min((cur_r,cur_c),(next_r,next_c)),
+                              max((cur_r,cur_c),(next_r,next_c)))
+                        chain.append((next_r, next_c))
+                        visited_edges.add(e2)
+                        prev_r, prev_c = cur_r, cur_c
+                        cur_r, cur_c = next_r, next_c
+                        # Parar se chegou a um nó
+                        if node_mask[cur_r, cur_c]:
+                            break
+                    else:
+                        # Pixel com múltiplos vizinhos não-anteriores
+                        # → é uma junção não classificada (raro após thin)
+                        # Terminar a aresta aqui
                         break
 
                 if len(chain) >= 2:
                     lines_rc.append(chain)
 
-            if si % 5000 == 0:
-                feedback.setProgress(53 + int(si / max(total_starts, 1) * 5))
+            if ni % 2000 == 0:
+                feedback.setProgress(53 + int(ni / max(total_nodes, 1) * 5))
                 if feedback.isCanceled():
                     return {}
+
+        # ── SEGUNDA PASSAGEM: pixels orphaned ──────────────────────────
+        # Pixels internos não cobertos pelo rastreio de grafo
+        # (ex: linhas circulares sem nenhum nó, ou trechos isolados).
+        visited_flat = set()
+        for chain in lines_rc:
+            for px in chain:
+                visited_flat.add(px)
+
+        orphaned_mask = skel_arr.copy()
+        for r, c in visited_flat:
+            orphaned_mask[r, c] = False
+        n_orphaned = int(orphaned_mask.sum())
 
         # ── SEGUNDA PASSAGEM: pixels orphaned ──────────────────────────
         # Pixels activos que não foram visitados na primeira passagem.
@@ -1080,7 +1117,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         # Estratégia: encontrar todos os pixels activos não visitados,
         # agrupá-los por conectividade (scipy.ndimage.label) e rastrear
         # cada grupo independentemente a partir do seu primeiro pixel.
-        orphaned_mask = skel_arr & ~visited
+# orphaned_mask já calculado no bloco do grafo acima
         n_orphaned = int(orphaned_mask.sum())
         if n_orphaned > 0:
             feedback.pushInfo(self.tr(
@@ -1148,7 +1185,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             f"{n_after_orphan} pixels ainda nao cobertos (isolados)."
         ))
 
-        del skel_arr, visited, terminals, internals, junctions, n_neighbors
+        del skel_arr, terminals, internals, junctions, n_neighbors, visited_flat
         gc.collect()
         feedback.setProgress(58)
 
