@@ -1189,16 +1189,31 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             if len(chain) < 2:
                 continue
 
-            # As cadeias da primeira passagem já estão ordenadas spatialmente.
-            # As cadeias da segunda passagem agora também (rastreio em cadeia).
-            # Conversão directa O(n) — sem nearest-neighbour sort.
+            # Converter (row,col) → coordenadas reais
             coords = [_rc_to_xy(r, c) for r, c in chain]
             if len(coords) < 2:
                 continue
 
-            line = ShpLineString(coords).simplify(simplify_tol, preserve_topology=True)
+            # Guardar as extremidades exactas ANTES do simplify.
+            # O simplify(RDP) pode deslocar os pontos de início/fim —
+            # isso quebra a topologia nas junções.
+            # Aplicamos simplify e depois restauramos as extremidades originais.
+            pt_start = coords[0]
+            pt_end   = coords[-1]
+
+            line = ShpLineString(coords).simplify(simplify_tol, preserve_topology=False)
             if line.is_empty or line.length == 0:
                 continue
+
+            # Restaurar extremidades exactas após simplify
+            simplified_coords = list(line.coords)
+            if len(simplified_coords) >= 2:
+                simplified_coords[0]  = pt_start
+                simplified_coords[-1] = pt_end
+                line = ShpLineString(simplified_coords)
+                if line.is_empty or line.length == 0:
+                    continue
+
             shapely_lines.append(line)
 
         del lines_rc
