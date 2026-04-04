@@ -1043,10 +1043,23 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     nbs = _get_active_neighbors(cur_r, cur_c)
                     if not nbs:
                         break
-                    # Se há múltiplos vizinhos não visitados: chegou a junção.
-                    # Parar aqui — não adicionar o pixel de junção à cadeia
-                    # (ele pertence ao ponto de arranque de outras cadeias).
                     if len(nbs) > 1:
+                        # Chegou a uma junção com múltiplos ramos.
+                        # Adicionar o PRIMEIRO vizinho da junção como último
+                        # ponto da cadeia, SEM marcar como visitado.
+                        # Isso garante que o endpoint desta cadeia coincide
+                        # exactamente com o startpoint das outras cadeias
+                        # que partem deste pixel de junção.
+                        # Escolher o vizinho que seja uma junção (se existir),
+                        # senão usar o primeiro disponível.
+                        junction_nb = None
+                        for nb_r, nb_c in nbs:
+                            if junctions[nb_r, nb_c]:
+                                junction_nb = (nb_r, nb_c)
+                                break
+                        end_pt = junction_nb if junction_nb else nbs[0]
+                        chain.append(end_pt)
+                        # NÃO marcar como visitado — outras cadeias precisam deste ponto
                         break
                     next_r, next_c = nbs[0]
                     chain.append((next_r, next_c))
@@ -1214,6 +1227,51 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             merged_lines = [g for g in merged.geoms if g.geom_type == "LineString"]
 
         feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos linemerge."))
+
+        # ── SNAP TOPOLÓGICO: forçar extremidades coincidentes ───────────
+        # Após o linemerge, extremidades que deveriam coincidir podem
+        # diferir por floating point (< 1 pixel). O linemerge só une
+        # linhas com extremidades EXACTAMENTE iguais. O snap garante que
+        # pontos a menos de SNAP_TOL metros são forçados a coincidir.
+        # SNAP_TOL = 1 pixel (tamanho mínimo de gap esperado).
+        SNAP_TOL = pixel_size * 1.5
+
+        # Recolher todas as extremidades
+        endpoints_snap = {}   # (r_round, c_round) → coord exacta mais frequente
+        for ml in merged_lines:
+            coords_ml = list(ml.coords)
+            for pt in [coords_ml[0], coords_ml[-1]]:
+                key = (round(pt[0] / SNAP_TOL), round(pt[1] / SNAP_TOL))
+                if key not in endpoints_snap:
+                    endpoints_snap[key] = pt
+
+        def _snap_coord(pt):
+            key = (round(pt[0] / SNAP_TOL), round(pt[1] / SNAP_TOL))
+            return endpoints_snap.get(key, pt)
+
+        snapped_lines = []
+        for ml in merged_lines:
+            coords_ml = list(ml.coords)
+            if len(coords_ml) < 2:
+                continue
+            coords_ml[0]  = _snap_coord(coords_ml[0])
+            coords_ml[-1] = _snap_coord(coords_ml[-1])
+            snapped_lines.append(ShpLineString(coords_ml))
+
+        # Re-executar linemerge após snap para unir o que antes não unia
+        merged2 = linemerge(snapped_lines)
+        del snapped_lines, endpoints_snap
+        gc.collect()
+
+        if merged2.geom_type == "LineString":
+            merged_lines = [merged2]
+        elif merged2.geom_type == "MultiLineString":
+            merged_lines = list(merged2.geoms)
+        else:
+            merged_lines = [g for g in getattr(merged2, "geoms", [])
+                           if g.geom_type == "LineString"]
+
+        feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos snap topologico."))
 
         # ── DEDUPLICAÇÃO POR DISTÂNCIA MÉDIA (Hausdorff aproximado) ────
         # Compara amostras de pontos ao longo de cada par de linhas.
