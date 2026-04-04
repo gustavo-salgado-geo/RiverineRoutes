@@ -1044,22 +1044,14 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     if not nbs:
                         break
                     if len(nbs) > 1:
-                        # Chegou a uma junção com múltiplos ramos.
-                        # Adicionar o PRIMEIRO vizinho da junção como último
-                        # ponto da cadeia, SEM marcar como visitado.
-                        # Isso garante que o endpoint desta cadeia coincide
-                        # exactamente com o startpoint das outras cadeias
-                        # que partem deste pixel de junção.
-                        # Escolher o vizinho que seja uma junção (se existir),
-                        # senão usar o primeiro disponível.
-                        junction_nb = None
-                        for nb_r, nb_c in nbs:
-                            if junctions[nb_r, nb_c]:
-                                junction_nb = (nb_r, nb_c)
-                                break
-                        end_pt = junction_nb if junction_nb else nbs[0]
-                        chain.append(end_pt)
-                        # NÃO marcar como visitado — outras cadeias precisam deste ponto
+                        # O pixel ACTUAL (cur_r, cur_c) tem múltiplos vizinhos
+                        # não visitados — ele próprio é uma junção ou está
+                        # adjacente a uma. O ponto de chegada desta cadeia
+                        # deve ser o pixel ACTUAL, que já está na chain.
+                        # Não adicionar nenhum vizinho extra.
+                        # O pixel actual JÁ ESTÁ marcado como visitado, por isso
+                        # será o ponto de arranque das cadeias seguintes apenas
+                        # se for uma junção (está em start_mask).
                         break
                     next_r, next_c = nbs[0]
                     chain.append((next_r, next_c))
@@ -1228,39 +1220,92 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos linemerge."))
 
-        # ── SNAP TOPOLÓGICO: forçar extremidades coincidentes ───────────
-        # Após o linemerge, extremidades que deveriam coincidir podem
-        # diferir por floating point (< 1 pixel). O linemerge só une
-        # linhas com extremidades EXACTAMENTE iguais. O snap garante que
-        # pontos a menos de SNAP_TOL metros são forçados a coincidir.
-        # SNAP_TOL = 1 pixel (tamanho mínimo de gap esperado).
-        SNAP_TOL = pixel_size * 1.5
+        # ── SNAP TOPOLÓGICO COM cKDTree ─────────────────────────────────
+        # Problema do snap por grid: dois pontos na fronteira de células
+        # adjacentes do grid ficam em chaves diferentes mesmo sendo
+        # vizinhos próximos — não são unidos.
+        #
+        # Solução com cKDTree:
+        #   1. Recolher todas as extremidades (primeiro e último ponto
+        #      de cada linha).
+        #   2. Para cada extremidade, encontrar todas as outras dentro
+        #      de SNAP_TOL usando query_ball_point (O(n log n)).
+        #   3. Agrupar extremidades próximas por union-find e forçar
+        #      todas do mesmo grupo para a mesma coordenada (a média).
+        #   4. Re-executar linemerge com as coords corrigidas.
+        # ---------------------------------------------------------------
+        from scipy.spatial import cKDTree as _cKDTree
 
-        # Recolher todas as extremidades
-        endpoints_snap = {}   # (r_round, c_round) → coord exacta mais frequente
-        for ml in merged_lines:
+        SNAP_TOL = pixel_size * 2.0   # 2 pixels — cobre gaps do rastreio
+
+        # Recolher todas as extremidades com índice
+        all_endpoints = []   # lista de (x, y)
+        ep_map = []          # (line_idx, 'start'|'end')
+        for li, ml in enumerate(merged_lines):
             coords_ml = list(ml.coords)
-            for pt in [coords_ml[0], coords_ml[-1]]:
-                key = (round(pt[0] / SNAP_TOL), round(pt[1] / SNAP_TOL))
-                if key not in endpoints_snap:
-                    endpoints_snap[key] = pt
+            all_endpoints.append(coords_ml[0])
+            ep_map.append((li, 0))           # 0 = start
+            all_endpoints.append(coords_ml[-1])
+            ep_map.append((li, -1))          # -1 = end
 
-        def _snap_coord(pt):
-            key = (round(pt[0] / SNAP_TOL), round(pt[1] / SNAP_TOL))
-            return endpoints_snap.get(key, pt)
+        if len(all_endpoints) >= 2:
+            ep_arr  = np.array(all_endpoints)
+            tree    = _cKDTree(ep_arr)
+            pairs   = tree.query_pairs(SNAP_TOL)   # set de (i, j) com dist < tol
 
-        snapped_lines = []
-        for ml in merged_lines:
-            coords_ml = list(ml.coords)
-            if len(coords_ml) < 2:
-                continue
-            coords_ml[0]  = _snap_coord(coords_ml[0])
-            coords_ml[-1] = _snap_coord(coords_ml[-1])
-            snapped_lines.append(ShpLineString(coords_ml))
+            # Union-Find para agrupar extremidades próximas
+            parent = list(range(len(all_endpoints)))
+            def _find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+            def _union(a, b):
+                a, b = _find(a), _find(b)
+                if a != b: parent[b] = a
 
-        # Re-executar linemerge após snap para unir o que antes não unia
+            for i, j in pairs:
+                _union(i, j)
+
+            # Para cada grupo, calcular a coordenada média e aplicar
+            from collections import defaultdict
+            groups = defaultdict(list)
+            for idx in range(len(all_endpoints)):
+                groups[_find(idx)].append(idx)
+
+            # Criar dicionário de substituição: idx → coord_media do grupo
+            snap_to = {}
+            for root, members in groups.items():
+                if len(members) < 2:
+                    continue   # sem vizinhos — não precisa de snap
+                xs = [all_endpoints[m][0] for m in members]
+                ys = [all_endpoints[m][1] for m in members]
+                cx_mean = sum(xs) / len(xs)
+                cy_mean = sum(ys) / len(ys)
+                for m in members:
+                    snap_to[m] = (cx_mean, cy_mean)
+
+            # Aplicar snap às linhas
+            snapped_lines = []
+            for li, ml in enumerate(merged_lines):
+                coords_ml = list(ml.coords)
+                start_idx = li * 2
+                end_idx   = li * 2 + 1
+                if start_idx in snap_to:
+                    coords_ml[0]  = snap_to[start_idx]
+                if end_idx in snap_to:
+                    coords_ml[-1] = snap_to[end_idx]
+                if len(coords_ml) >= 2:
+                    snapped_lines.append(ShpLineString(coords_ml))
+
+            del tree, ep_arr, groups, snap_to
+            gc.collect()
+        else:
+            snapped_lines = merged_lines
+
+        # Re-executar linemerge após snap
         merged2 = linemerge(snapped_lines)
-        del snapped_lines, endpoints_snap
+        del snapped_lines
         gc.collect()
 
         if merged2.geom_type == "LineString":
@@ -1271,7 +1316,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             merged_lines = [g for g in getattr(merged2, "geoms", [])
                            if g.geom_type == "LineString"]
 
-        feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos snap topologico."))
+        feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos snap topologico (cKDTree)."))
 
         # ── DEDUPLICAÇÃO POR DISTÂNCIA MÉDIA (Hausdorff aproximado) ────
         # Compara amostras de pontos ao longo de cada par de linhas.
