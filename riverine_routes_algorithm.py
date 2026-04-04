@@ -1117,13 +1117,13 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         # Estratégia: encontrar todos os pixels activos não visitados,
         # agrupá-los por conectividade (scipy.ndimage.label) e rastrear
         # cada grupo independentemente a partir do seu primeiro pixel.
-# orphaned_mask já calculado no bloco do grafo acima
-        n_orphaned = int(orphaned_mask.sum())
+        # ── SEGUNDA PASSAGEM: pixels orphaned ──────────────────────────
+        # Pixels internos nao cobertos pelo rastreio de grafo.
+        # (ex: loops sem nos, ou trechos isolados sem terminal/juncao)
         if n_orphaned > 0:
             feedback.pushInfo(self.tr(
                 f"  Segunda passagem: {n_orphaned} pixels orphaned a rastrear..."
             ))
-            # Agrupar pixels orphaned por conectividade 8-conexa
             struct_8 = np.ones((3, 3), dtype=bool)
             labeled_orphans, n_groups = nd_label(orphaned_mask, structure=struct_8)
 
@@ -1132,39 +1132,34 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 grp_rows, grp_cols = np.where(grp_mask)
                 if len(grp_rows) < 2:
                     # Pixel isolado — ignorar
-                    visited[grp_rows[0], grp_cols[0]] = True
+                    visited_flat.add((int(grp_rows[0]), int(grp_cols[0])))
                     continue
 
-                # Ponto de arranque: pixel da extremidade do grupo
-                # (pixel com menor número de vizinhos no grupo = terminal)
-                # Isto garante que o rastreio começa numa ponta, não no meio.
+                # Ponto de arranque: pixel terminal do grupo (menos vizinhos)
                 sr2, sc2 = int(grp_rows[0]), int(grp_cols[0])
                 best_start_n = 9
                 for ri, ci in zip(grp_rows.tolist(), grp_cols.tolist()):
-                    n_nb = 0
-                    for dr, dc in NEIGHBORS_8:
-                        nr2_, nc2_ = ri+dr, ci+dc
-                        if 0 <= nr2_ < skel_arr.shape[0] and 0 <= nc2_ < skel_arr.shape[1]:
-                            if grp_mask[nr2_, nc2_]:
-                                n_nb += 1
+                    n_nb = sum(
+                        1 for dr, dc in NEIGHBORS_8
+                        if 0 <= ri+dr < grp_mask.shape[0]
+                        and 0 <= ci+dc < grp_mask.shape[1]
+                        and grp_mask[ri+dr, ci+dc]
+                    )
                     if n_nb < best_start_n:
                         best_start_n = n_nb
                         sr2, sc2 = int(ri), int(ci)
                     if best_start_n == 1:
-                        break  # terminal encontrado — não há melhor arranque
+                        break
 
-                # Rastreio em cadeia ordenada (segue vizinhos um a um)
-                # DIFERENTE do DFS: usa fila de 1 elemento, sempre seguindo
-                # o próximo vizinho não visitado. Gera coords em ordem espacial.
-                chain2 = []
-                v2     = np.zeros(skel_arr.shape, dtype=bool)
+                # Rastreio em cadeia ordenada dentro do grupo
+                chain2  = []
+                v2      = np.zeros(skel_arr.shape, dtype=bool)
                 cur_r2, cur_c2 = sr2, sc2
 
                 while True:
-                    v2[cur_r2, cur_c2]      = True
-                    visited[cur_r2, cur_c2] = True
+                    v2[cur_r2, cur_c2] = True
+                    visited_flat.add((cur_r2, cur_c2))
                     chain2.append((cur_r2, cur_c2))
-                    # Procurar próximo vizinho não visitado dentro do grupo
                     next_r2, next_c2 = -1, -1
                     for dr, dc in NEIGHBORS_8:
                         nr2, nc2 = cur_r2+dr, cur_c2+dc
@@ -1173,19 +1168,20 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                                 next_r2, next_c2 = nr2, nc2
                                 break
                     if next_r2 == -1:
-                        break  # fim da cadeia
+                        break
                     cur_r2, cur_c2 = next_r2, next_c2
 
                 if len(chain2) >= 2:
                     lines_rc.append(chain2)
 
-        n_after_orphan = int((skel_arr & ~visited).sum())
+        # Contar pixels ainda nao cobertos (apenas para log)
+        n_after_orphan = int(orphaned_mask.sum()) - n_orphaned
         feedback.pushInfo(self.tr(
             f"Rastreio concluido: {len(lines_rc)} cadeias | "
-            f"{n_after_orphan} pixels ainda nao cobertos (isolados)."
+            f"{max(0, n_orphaned - len(visited_flat))} pixels ainda nao cobertos."
         ))
 
-        del skel_arr, terminals, internals, junctions, n_neighbors, visited_flat
+        del skel_arr, terminals, internals, junctions, n_neighbors, visited_flat, orphaned_mask
         gc.collect()
         feedback.setProgress(58)
 
