@@ -1185,34 +1185,73 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         shapely_lines = []
 
         feedback.pushInfo(self.tr("  Convertendo cadeias para LineStrings..."))
+        # SMOOTH_WINDOW: raio da janela da média móvel em pixels.
+        # Valor = pixels equivalentes a 1/4 do buffer marginal.
+        # Exemplo: buffer=200m, pixel=10m → smooth_window = 5 pixels.
+        # Mínimo de 2 (janela de 5 pontos) para ter efeito visível.
+        smooth_window = max(2, int(round((buffer_dist_m * 0.25) / max(pixel_size_m, 1e-6))))
+        feedback.pushInfo(self.tr(
+            f"  Smooth de media movel: janela={smooth_window * 2 + 1} pontos "
+            f"({smooth_window * 2 + 1} x {pixel_size_m:.1f}m = "
+            f"{(smooth_window * 2 + 1) * pixel_size_m:.1f}m)"
+        ))
+
+        def _moving_average_smooth(coords, window, pt_start, pt_end):
+            """
+            Suaviza uma lista de coordenadas por média móvel simétrica.
+
+            Para cada ponto i, a posição suavizada é a média dos pontos
+            no intervalo [i-window, i+window]. As extremidades (pt_start
+            e pt_end) são sempre preservadas exactas — garantia topológica.
+
+            Parâmetros:
+                coords   — lista de (x, y)
+                window   — raio da janela (número de pontos de cada lado)
+                pt_start — coordenada exacta do início (imutável)
+                pt_end   — coordenada exacta do fim (imutável)
+            """
+            n = len(coords)
+            if n < 3:
+                return coords
+
+            xs = [c[0] for c in coords]
+            ys = [c[1] for c in coords]
+            sx, sy = [], []
+
+            for i in range(n):
+                lo = max(0, i - window)
+                hi = min(n - 1, i + window)
+                count = hi - lo + 1
+                sx.append(sum(xs[lo:hi+1]) / count)
+                sy.append(sum(ys[lo:hi+1]) / count)
+
+            # Restaurar extremidades exactas — nunca movidas pelo smooth
+            sx[0],  sy[0]  = pt_start[0], pt_start[1]
+            sx[-1], sy[-1] = pt_end[0],   pt_end[1]
+
+            return list(zip(sx, sy))
+
         for chain in lines_rc:
             if len(chain) < 2:
                 continue
 
-            # Converter (row,col) → coordenadas reais
             coords = [_rc_to_xy(r, c) for r, c in chain]
             if len(coords) < 2:
                 continue
 
-            # Guardar as extremidades exactas ANTES do simplify.
-            # O simplify(RDP) pode deslocar os pontos de início/fim —
-            # isso quebra a topologia nas junções.
-            # Aplicamos simplify e depois restauramos as extremidades originais.
+            # Preservar extremidades exactas para garantia topológica
             pt_start = coords[0]
             pt_end   = coords[-1]
 
-            line = ShpLineString(coords).simplify(simplify_tol, preserve_topology=False)
-            if line.is_empty or line.length == 0:
+            # Aplicar média móvel para suavizar degraus de pixel
+            # (substitui o simplify RDP — suaviza sem remover pontos)
+            smoothed = _moving_average_smooth(coords, smooth_window, pt_start, pt_end)
+            if len(smoothed) < 2:
                 continue
 
-            # Restaurar extremidades exactas após simplify
-            simplified_coords = list(line.coords)
-            if len(simplified_coords) >= 2:
-                simplified_coords[0]  = pt_start
-                simplified_coords[-1] = pt_end
-                line = ShpLineString(simplified_coords)
-                if line.is_empty or line.length == 0:
-                    continue
+            line = ShpLineString(smoothed)
+            if line.is_empty or line.length == 0:
+                continue
 
             shapely_lines.append(line)
 
