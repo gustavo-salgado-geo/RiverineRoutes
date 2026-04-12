@@ -672,6 +672,70 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             self.tr(f"SRC QGIS de trabalho definido: {work_crs_qgs.authid()}")
         )
 
+        # ── PRÉ-PROCESSAMENTO DO VETOR: preencher buracos (ilhas) ───────
+        #
+        # O vetor de água pode ter "furos" — polígonos com anéis interiores
+        # representando ilhas. Para o skeletonize e para as linhas centrais,
+        # precisamos de polígonos PREENCHIDOS (sem ilhas), caso contrário o
+        # esqueleto contorna as ilhas em vez de passar pelo centro do canal.
+        #
+        # vector_path_filled → usado para: rasterizar, skeletonize, centrais,
+        #                       marginais, e como base das transversais.
+        # vector_path_orig   → usado para: clip final das transversais.
+        #                       (as transversais são cortadas pelo vetor
+        #                        ORIGINAL, preservando as ilhas no resultado)
+        # ---------------------------------------------------------------
+        feedback.pushInfo(self.tr("A preencher buracos (ilhas) no vetor de agua..."))
+
+        gdf_fill = _read_vector(vector_path)[["geometry"]].copy()
+
+        def _fill_holes(geom):
+            """Remove todos os anéis interiores de uma geometria Shapely."""
+            from shapely.geometry import Polygon, MultiPolygon
+            if geom is None or geom.is_empty:
+                return geom
+            if geom.geom_type == "Polygon":
+                return Polygon(geom.exterior)
+            if geom.geom_type == "MultiPolygon":
+                return MultiPolygon([Polygon(p.exterior) for p in geom.geoms])
+            return geom
+
+        gdf_fill["geometry"] = gdf_fill["geometry"].apply(_fill_holes)
+        gdf_fill = gdf_fill[~gdf_fill.geometry.is_empty].reset_index(drop=True)
+
+        temp_filled_path = os.path.join(tmp, "temp_water_filled.gpkg")
+        gdf_fill.to_file(temp_filled_path, driver="GPKG")
+        del gdf_fill
+        gc.collect()
+
+        # vector_path_for_skel = vetor sem ilhas (para skeletonize e centrais)
+        # vector_path          = vetor original (para clip das transversais)
+        vector_path_for_skel = temp_filled_path
+        feedback.pushInfo(self.tr("  Buracos preenchidos. Usando vetor preenchido para esqueletonizacao."))
+
+        # SRC QGIS de trabalho (usado no merge e na saída)
+        # Prioridade: (1) EPSG numérico extraído → constrói por código
+        #             (2) QgsRasterLayer.crs() → já é um objecto válido
+        #             (3) CRS do projecto QGIS → último recurso
+        if work_epsg:
+            work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
+        elif qgs_raster_crs.isValid():
+            work_crs_qgs = qgs_raster_crs
+            # Tentar recuperar o EPSG a partir do objecto QGIS como inteiro
+            try:
+                srid = qgs_raster_crs.postgisSrid()
+                if srid and srid > 0:
+                    work_epsg = srid
+                    work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
+            except Exception:
+                pass
+        else:
+            work_crs_qgs = context.project().crs()
+
+        feedback.pushInfo(
+            self.tr(f"SRC QGIS de trabalho definido: {work_crs_qgs.authid()}")
+        )
+
         # ── A. ROTAS CENTRAIS ───────────────────────────────────────────
         #
         # ESTRATÉGIA DE MEMÓRIA:
@@ -1734,10 +1798,19 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             f"  {len(central_line_list)} linhas centrais continuas para transversais."
         ))
 
-        # ── Carregar polígono de água ────────────────────────────────────
-        water_mask_gdf = _read_vector(vector_path)[["geometry"]]
-        water_union    = water_mask_gdf.geometry.unary_union
-        del water_mask_gdf
+        # ── Carregar polígonos de água ─────────────────────────────────
+        # water_union_filled: vetor SEM ilhas → usado para calcular a
+        #   distância ao limite e gerar perpendiculares correctas.
+        # water_union_orig:   vetor ORIGINAL (com ilhas) → clip final
+        #   das transversais, preservando as ilhas no resultado.
+        water_mask_filled = _read_vector(vector_path_for_skel)[["geometry"]]
+        water_union_filled = water_mask_filled.geometry.unary_union
+        del water_mask_filled
+        gc.collect()
+
+        water_mask_orig = _read_vector(vector_path)[["geometry"]]
+        water_union_orig = water_mask_orig.geometry.unary_union
+        del water_mask_orig
         gc.collect()
 
         # ── Criar datasource OGR ─────────────────────────────────────────
