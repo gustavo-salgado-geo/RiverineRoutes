@@ -649,29 +649,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # SRC QGIS de trabalho (usado no merge e na saída)
-        # Prioridade: (1) EPSG numérico extraído → constrói por código
-        #             (2) QgsRasterLayer.crs() → já é um objecto válido
-        #             (3) CRS do projecto QGIS → último recurso
-        if work_epsg:
-            work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
-        elif qgs_raster_crs.isValid():
-            work_crs_qgs = qgs_raster_crs
-            # Tentar recuperar o EPSG a partir do objecto QGIS como inteiro
-            try:
-                srid = qgs_raster_crs.postgisSrid()
-                if srid and srid > 0:
-                    work_epsg = srid
-                    work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
-            except Exception:
-                pass
-        else:
-            work_crs_qgs = context.project().crs()
-
-        feedback.pushInfo(
-            self.tr(f"SRC QGIS de trabalho definido: {work_crs_qgs.authid()}")
-        )
-
         # ── PRÉ-PROCESSAMENTO DO VETOR: preencher buracos (ilhas) ───────
         #
         # O vetor de água pode ter "furos" — polígonos com anéis interiores
@@ -1881,9 +1858,10 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             # primeiro intervalo para não colocar transversais nas pontas
             dist = transect_interval_m / 2.0
             while dist < length:
-                perp = _make_perpendicular_v2(line, dist, water_union)
+                perp = _make_perpendicular_v2(line, dist, water_union_filled)
                 if perp is not None:
-                    clipped = perp.intersection(water_union)
+                    # Clip com vetor ORIGINAL (com ilhas) — preserva ilhas no resultado
+                    clipped = perp.intersection(water_union_orig)
                     if not clipped.is_empty and clipped.length > 1.0:
                         # Extrair todos os segmentos de linha do resultado do clip
                         candidates = []
@@ -1927,7 +1905,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         lyr_t.CommitTransaction()
         ds_t = None
-        del central_line_list, water_union
+        del central_line_list, water_union_filled, water_union_orig
         gc.collect()
 
         feedback.pushInfo(self.tr(f"Transversais concluidas: {t_count} rotas geradas."))
