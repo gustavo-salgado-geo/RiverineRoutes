@@ -345,29 +345,375 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-    def _extrair_rede(self, raster_input_path, out_gpkg_path, tmp_folder, buffer_dist_m, work_crs_qgs, water_union_geom, feedback, suffix=""):
-        """
-        Gera o esqueleto, faz o rastreio do grafo de pixels, suaviza, une e exporta para GPKG.
-        """
-        import os, gc, rasterio
-        from osgeo import ogr, osr
-        from shapely.geometry import LineString as ShpLineString, Point as ShpPoint
-        from shapely.ops import linemerge
-        import numpy as np
-        
-        feedback.pushInfo(self.tr(f"A iniciar extracção de rede ({suffix})..."))
+    # ------------------------------------------------------------------
+    def processAlgorithm(self, parameters, context, feedback):
 
-        # Nomes de arquivos temporários exclusivos para esta rodada
-        temp_uint8_path = os.path.join(tmp_folder, f"temp_uint8_{suffix}.tif")
-        temp_skel_path  = os.path.join(tmp_folder, f"temp_skeleton_{suffix}.tif")
+        # ── 0. FIXAR PROJ_DATA para o OSGeo4W — DEVE SER O PRIMEIRO PASSO
+        #
+        # O GDAL/OGR e o OSR usam o PROJ para resolver CRSs. Quando há
+        # múltiplas instalações do PROJ no sistema (OSGeo4W + pip + Anaconda),
+        # o GDAL pode encontrar um proj.db de versão errada e falhar com
+        # "no database context specified" ou "Cannot parse CRS".
+        #
+        # Solução: forçar PROJ_DATA (e o alias PROJ_LIB) para o caminho
+        # do OSGeo4W ANTES de qualquer chamada GDAL/OGR/OSR.
+        # O caminho é detectado a partir da localização do gdal.py do OSGeo4W.
+        # ---------------------------------------------------------------
+        import os as _os
+        try:
+            from osgeo import gdal as _gdal_probe, osr as _osr_probe
+            # Determinar a pasta do OSGeo4W a partir do caminho do gdal.py
+            _gdal_path = _gdal_probe.__file__                  # ex: C:\...\OSGeo4W\...\gdal.py
+            _osgeo4w_root = _gdal_path
+            for _ in range(6):                                 # subir até 6 níveis
+                _osgeo4w_root = _os.path.dirname(_osgeo4w_root)
+                _proj_db_candidate = _os.path.join(_osgeo4w_root, "share", "proj", "proj.db")
+                if _os.path.isfile(_proj_db_candidate):
+                    _proj_data_dir = _os.path.join(_osgeo4w_root, "share", "proj")
+                    _os.environ["PROJ_DATA"] = _proj_data_dir
+                    _os.environ["PROJ_LIB"]  = _proj_data_dir  # alias legacy
+                    # Reinicializar o contexto PROJ do OSR
+                    try:
+                        _osr_probe.SetPROJSearchPaths([_proj_data_dir])
+                    except Exception:
+                        pass
+                    feedback.pushInfo(self.tr(f"PROJ_DATA fixado: {_proj_data_dir}"))
+                    break
+            else:
+                feedback.pushWarning(self.tr(
+                    "Nao foi possivel localizar o proj.db do OSGeo4W automaticamente. "
+                    "Se ocorrerem erros de CRS, defina a variavel PROJ_DATA manualmente."
+                ))
+        except Exception as _e_proj:
+            feedback.pushWarning(self.tr(f"Aviso ao fixar PROJ_DATA: {_e_proj}"))
+
+        # ── 1. Recuperar parâmetros ─────────────────────────────────────
+        raster_layer  = self.parameterAsRasterLayer(parameters, self.INPUT_RASTER, context)
+        vector_layer  = self.parameterAsVectorLayer(parameters, self.INPUT_VECTOR, context)
+        gps_layer     = self.parameterAsVectorLayer(parameters, self.INPUT_GPS_TRACKS, context)
+        limits_layer  = self.parameterAsVectorLayer(parameters, self.INPUT_LIMITS, context)
+
+        buffer_dist_m    = self.parameterAsDouble(parameters, self.BUFFER_DIST, context)
+        transect_interval_m = self.parameterAsDouble(parameters, self.TRANSECT_INTERVAL, context)
+
+        output_crs_param = self.parameterAsCrs(parameters, self.OUTPUT_CRS, context)
+
+        raster_path_orig = raster_layer.source()
+        vector_path_orig = vector_layer.source()
+        tmp = context.temporaryFolder()
+
+        # ── 2. Detectar CRS e reprojetar se necessário ──────────────────
+        #
+        # FONTE DE VERDADE: os objetos QgsRasterLayer / QgsVectorLayer do QGIS.
+        # O QGIS pode ter o SRC definido na camada em memória mesmo quando o
+        # ficheiro físico não gravou os metadados de projeção. Usar rasterio/
+        # geopandas diretamente no ficheiro falha nesses casos.
+        # Rasterio e geopandas são usados apenas como fallback de último recurso.
+        # -----------------------------------------------------------------
+        feedback.pushInfo(self.tr("A verificar SRC dos dados de entrada..."))
+
+        # ---- 2a. CRS do raster — fonte primária: QgsRasterLayer -----------
+        qgs_raster_crs = raster_layer.crs()          # QgsCoordinateReferenceSystem
+        raster_crs_wkt = None
+        raster_is_geo  = None
+
+        if qgs_raster_crs.isValid():
+            raster_crs_wkt = qgs_raster_crs.toWkt()
+            raster_is_geo  = _is_geographic(raster_crs_wkt)
+            feedback.pushInfo(
+                self.tr(
+                    f"SRC do raster lido do QGIS: "
+                    f"{qgs_raster_crs.authid()} — "
+                    f"{'Geográfico (graus)' if raster_is_geo else 'Projetado (métrico)'}"
+                )
+            )
+        else:
+            # Fallback: tentar rasterio diretamente no ficheiro
+            try:
+                with rasterio.open(raster_path_orig) as src:
+                    if src.crs is not None:
+                        raster_crs_wkt = src.crs.to_wkt()
+                        raster_is_geo  = _is_geographic(raster_crs_wkt)
+                        feedback.pushInfo(
+                            self.tr(
+                                f"SRC do raster lido via rasterio: "
+                                f"{'Geográfico' if raster_is_geo else 'Projetado'}"
+                            )
+                        )
+            except Exception:
+                pass
+            if raster_crs_wkt is None:
+                feedback.pushWarning(
+                    self.tr(
+                        "AVISO: O raster não tem SRC definido nem no QGIS nem no ficheiro. "
+                        "O algoritmo tentará usar o SRC do vetor. "
+                        "Para evitar este aviso, atribua o SRC ao raster no QGIS "
+                        "(Raster → Projeções → Atribuir SRC)."
+                    )
+                )
+
+        # ---- 2b. CRS do vetor — fonte primária: QgsVectorLayer ------------
+        qgs_vector_crs = vector_layer.crs()
+        vector_epsg    = None
+        vector_is_geo  = None
+
+        if qgs_vector_crs.isValid():
+            vector_crs_wkt = qgs_vector_crs.toWkt()
+            vector_is_geo  = _is_geographic(vector_crs_wkt)
+            try:
+                auth_id = qgs_vector_crs.authid()   # ex: "EPSG:31982"
+                if auth_id.upper().startswith("EPSG:"):
+                    vector_epsg = int(auth_id.split(":")[1])
+            except Exception:
+                vector_epsg = None
+            feedback.pushInfo(
+                self.tr(
+                    f"SRC do vetor lido do QGIS: "
+                    f"{qgs_vector_crs.authid()} — "
+                    f"{'Geográfico (graus)' if vector_is_geo else 'Projetado (métrico)'}"
+                )
+            )
+        else:
+            # Fallback: tentar geopandas
+            try:
+                gdf_crs_check = _read_vector(vector_path_orig)
+                if gdf_crs_check.crs is not None:
+                    vector_epsg   = gdf_crs_check.crs.to_epsg()
+                    vector_is_geo = gdf_crs_check.crs.is_geographic
+                    feedback.pushInfo(
+                        self.tr(
+                            f"SRC do vetor lido via geopandas: EPSG:{vector_epsg}"
+                        )
+                    )
+            except Exception:
+                pass
+            if vector_is_geo is None:
+                feedback.pushWarning(
+                    self.tr(
+                        "AVISO: O vetor não tem SRC definido nem no QGIS nem no ficheiro."
+                    )
+                )
+
+        # ---- 2c. Ambos sem SRC — erro fatal --------------------------------
+        if raster_crs_wkt is None and vector_is_geo is None:
+            feedback.reportError(
+                self.tr(
+                    "ERRO: Nao foi possivel determinar o SRC do raster nem do vetor. "
+                    "Atribua o SRC correto a ambas as camadas no QGIS e tente novamente. "
+                    "Raster: clique direito → Propriedades → SRC ou Raster → Projecoes → Atribuir SRC. "
+                    "Vetor: clique direito na camada → Definir SRC da Camada."
+                ),
+                fatalError=True,
+            )
+            return {}
+
+        # ---- 2d. Determinar EPSG de trabalho (métrico) --------------------
+        #
+        # Prioridade: (1) raster métrico → usa direto
+        #             (2) raster geográfico → calcula UTM pelo centro do raster
+        #             (3) raster sem SRC + vetor métrico → usa EPSG do vetor
+        #             (4) raster sem SRC + vetor geográfico → calcula UTM pelo centroide do vetor
+
+        work_epsg = None
+
+        if raster_crs_wkt is not None and not raster_is_geo:
+            # Caso 1: raster já métrico.
+            # Fonte primária: authid do QgsCoordinateReferenceSystem (ex: "EPSG:32722").
+            # O pyproj é usado apenas se o authid não tiver prefixo EPSG.
+            work_epsg = None
+
+            # Tentativa 1: authid do QGIS (mais fiável — é o que o QGIS mostra ao utilizador)
+            try:
+                auth_id = qgs_raster_crs.authid()   # ex: "EPSG:32722"
+                if auth_id.upper().startswith("EPSG:"):
+                    work_epsg = int(auth_id.split(":")[1])
+            except Exception:
+                pass
+
+            # Tentativa 2: osr (fallback para SRCs não-EPSG)
+            if work_epsg is None:
+                try:
+                    from osgeo import osr as _osr2
+                    _srs2 = _osr2.SpatialReference()
+                    _srs2.ImportFromWkt(raster_crs_wkt)
+                    epsg_str = _srs2.GetAuthorityCode(None)
+                    if epsg_str:
+                        work_epsg = int(epsg_str)
+                except Exception:
+                    pass
+
+            # Tentativa 3: postgisSrid do QGIS (último recurso)
+            if work_epsg is None:
+                try:
+                    srid = qgs_raster_crs.postgisSrid()
+                    if srid and srid > 0:
+                        work_epsg = srid
+                except Exception:
+                    pass
+
+            if work_epsg:
+                feedback.pushInfo(
+                    self.tr(f"SRC de trabalho: EPSG:{work_epsg} (raster métrico, sem reprojeção).")
+                )
+            else:
+                # Nao conseguiu extrair EPSG numérico — usar o objecto QGIS directamente
+                # (work_crs_qgs será definido abaixo a partir de qgs_raster_crs)
+                feedback.pushWarning(
+                    self.tr(
+                        f"Nao foi possivel extrair o codigo EPSG numerico do SRC do raster "
+                        f"({qgs_raster_crs.authid()}). O SRC QGIS sera usado directamente. "
+                        f"Verifique os resultados."
+                    )
+                )
+            raster_path = raster_path_orig
+
+        elif raster_crs_wkt is not None and raster_is_geo:
+            # Caso 2: raster geográfico → reprojetar para UTM
+            lon, lat  = _get_raster_center_lonlat(raster_path_orig)
+            work_epsg = _auto_utm_epsg(lon, lat)
+            feedback.pushInfo(
+                self.tr(
+                    f"SRC do raster é geográfico. "
+                    f"Reprojetando para EPSG:{work_epsg} (UTM)..."
+                )
+            )
+            raster_path = _reproject_raster_to_metric(raster_path_orig, work_epsg, tmp)
+
+        elif vector_is_geo is not None and not vector_is_geo and vector_epsg:
+            # Caso 3: raster sem SRC, vetor já métrico
+            work_epsg = vector_epsg
+            feedback.pushWarning(
+                self.tr(
+                    f"Raster sem SRC. Usando SRC do vetor (EPSG:{work_epsg}) como SRC de trabalho. "
+                    f"Atribua o SRC real ao raster para evitar este aviso."
+                )
+            )
+            raster_path = raster_path_orig
+
+        else:
+            # Caso 4: raster sem SRC, vetor geográfico → UTM pelo centroide do vetor
+            try:
+                gdf_tmp = _read_vector(vector_path_orig)
+                cx = gdf_tmp.geometry.unary_union.centroid.x
+                cy = gdf_tmp.geometry.unary_union.centroid.y
+                work_epsg = _auto_utm_epsg(cx, cy)
+            except Exception:
+                feedback.reportError(
+                    self.tr(
+                        "ERRO: Não foi possível calcular o UTM automático. "
+                        "Atribua o SRC correto ao raster e tente novamente."
+                    ),
+                    fatalError=True,
+                )
+                return {}
+            feedback.pushWarning(
+                self.tr(
+                    f"Raster sem SRC e vetor geográfico. "
+                    f"Usando EPSG:{work_epsg} (UTM auto pelo centroide do vetor) "
+                    f"como SRC de trabalho."
+                )
+            )
+            raster_path = raster_path_orig
+
+        # ---- 2e. Reprojetar vetor se necessário ---------------------------
+        needs_vector_reproject = False
+        if vector_is_geo is True:
+            needs_vector_reproject = True
+        elif work_epsg and vector_epsg and vector_epsg != work_epsg:
+            needs_vector_reproject = True
+
+        if needs_vector_reproject:
+            feedback.pushInfo(
+                self.tr(
+                    f"SRC do vetor (EPSG:{vector_epsg}) difere do SRC de trabalho "
+                    f"(EPSG:{work_epsg}). A reprojetar vetor..."
+                )
+            )
+            vector_path = _reproject_vector_to_metric(vector_path_orig, work_epsg, tmp)
+        else:
+            feedback.pushInfo(
+                self.tr(
+                    f"SRC do vetor compativel com SRC de trabalho (EPSG:{work_epsg}). "
+                    f"Sem necessidade de reprojecao."
+                )
+            )
+            vector_path = vector_path_orig
+
+        # Leitura do GeoDataFrame do vetor (para uso nas etapas seguintes)
+        gdf_check = _read_vector(vector_path)
+
+        feedback.pushInfo(
+            self.tr(
+                f"Parâmetros de distância — Buffer: {buffer_dist_m} m | "
+                f"Transecto: {transect_interval_m} m"
+            )
+        )
+
+        # SRC QGIS de trabalho (usado no merge e na saída)
+        # Prioridade: (1) EPSG numérico extraído → constrói por código
+        #             (2) QgsRasterLayer.crs() → já é um objecto válido
+        #             (3) CRS do projecto QGIS → último recurso
+        if work_epsg:
+            work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
+        elif qgs_raster_crs.isValid():
+            work_crs_qgs = qgs_raster_crs
+            # Tentar recuperar o EPSG a partir do objecto QGIS como inteiro
+            try:
+                srid = qgs_raster_crs.postgisSrid()
+                if srid and srid > 0:
+                    work_epsg = srid
+                    work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
+            except Exception:
+                pass
+        else:
+            work_crs_qgs = context.project().crs()
+
+        feedback.pushInfo(
+            self.tr(f"SRC QGIS de trabalho definido: {work_crs_qgs.authid()}")
+        )
+
+        # ── A. ROTAS CENTRAIS ───────────────────────────────────────────
+        #
+        # ESTRATÉGIA DE MEMÓRIA:
+        #
+        # O skeletonize() precisa da imagem INTEIRA para gerar um esqueleto
+        # contínuo. Processar em blocos independentes cria descontinuidades
+        # nas bordas — por isso não é possível usar tiling directo.
+        #
+        # Estratégia adoptada (3 fases):
+        #
+        # FASE 1 — Quantização: ler o raster em blocos e gravar um raster
+        #   temporário uint8 comprimido. Reduz o tamanho antes de carregar
+        #   tudo na RAM (rasters float32/int16 passam para 1 byte/pixel).
+        #
+        # FASE 2 — Esqueletonização: carregar o raster uint8 comprimido
+        #   inteiro em RAM como array bool (menor pegada possível),
+        #   esqueletonizar, converter para uint8 e libertar o bool.
+        #
+        # FASE 3 — Gravação: gravar o esqueleto uint8 para disco em blocos
+        #   e libertar o array da memória antes de avançar.
+        #
+        # Pegada máxima de RAM durante a fase 2 (pior caso):
+        #   raster 500 MB × 1 byte/pixel (uint8 quantizado)
+        #   + array bool = mesma dimensão (~500 MB)
+        #   + array uint8 do esqueleto (~500 MB)
+        #   Total estimado: ~1.5 GB — aceitável para 8+ GB de RAM.
+        #
+        # Para rasters > 1 GB recomenda-se usar um SRC com tiles menores
+        # ou dividir a área de estudo em sub-regiões antes de processar.
+        # ---------------------------------------------------------------
+        feedback.pushInfo(self.tr("A gerar rotas centrais — fase 1/3: a quantizar raster..."))
+
+        temp_uint8_path = os.path.join(tmp, "temp_uint8.tif")
+        temp_skel_path  = os.path.join(tmp, "temp_skeleton.tif")
 
         # FASE 1: ler em blocos, gravar uint8 comprimido
-        with rasterio.open(raster_input_path) as src:
+        with rasterio.open(raster_path) as src:
             transform = src.transform
             crs       = src.crs
             height    = src.height
             width     = src.width
-            
+
             # Blocos de leitura: linhas suficientes para ~64 MB por bloco
             # (seguro mesmo com pouca RAM disponível nesta fase)
             bytes_per_row = width  # uint8 = 1 byte/pixel após conversão
@@ -1107,7 +1453,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos deduplicacao."))
 
         # ── Gravar via OGR ──────────────────────────────────────────────
-        out_gpkg_path = os.path.join(tmp, "temp_central.gpkg")
+        temp_central_path = os.path.join(tmp, "temp_central.gpkg")
 
         srs = osr.SpatialReference()
         srs_ok = False
@@ -1120,7 +1466,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             srs = None
 
         drv     = ogr.GetDriverByName("GPKG")
-        ds_cent = drv.CreateDataSource(out_gpkg_path)
+        ds_cent = drv.CreateDataSource(temp_central_path)
         lyr     = ds_cent.CreateLayer("central_routes", srs=srs, geom_type=ogr.wkbLineString)
         fdef    = ogr.FieldDefn("source", ogr.OFTString); fdef.SetWidth(32)
         lyr.CreateField(fdef)
@@ -1173,7 +1519,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         # Carregar polígono de água para validação da união
         water_gdf_join = _read_vector(vector_path)[["geometry"]]
-        water_union_geom = water_gdf_join.geometry.unary_union
+        water_union_join = water_gdf_join.geometry.unary_union
         del water_gdf_join
         gc.collect()
 
@@ -1183,7 +1529,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         # Ler todas as linhas do gpkg gerado
         from osgeo import ogr as _ogr2
-        ds_read = _ogr2.Open(out_gpkg_path)
+        ds_read = _ogr2.Open(temp_central_path)
         lyr_read = ds_read.GetLayer(0)
         central_shapely = []
         for feat_r in lyr_read:
@@ -1222,14 +1568,14 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     continue
                 # Verificar se a linha recta entre os pontos está dentro da água
                 connector = ShpLineString([pa.coords[0], pb.coords[0]])
-                if water_union_geom.contains(connector):
+                if water_union_join.contains(connector):
                     connector_lines.append(connector)
                     used_pairs.add(pair_key)
 
         if connector_lines:
             feedback.pushInfo(self.tr(f"  {len(connector_lines)} ligacoes criadas dentro da mascara de agua."))
             # Adicionar conectores ao gpkg existente
-            ds_conn = _ogr2.Open(out_gpkg_path, 1)  # 1 = update
+            ds_conn = _ogr2.Open(temp_central_path, 1)  # 1 = update
             lyr_conn = ds_conn.GetLayer(0)
             lyr_conn.StartTransaction()
             lyr_defn_conn = lyr_conn.GetLayerDefn()
@@ -1247,7 +1593,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         else:
             feedback.pushInfo(self.tr("  Nenhuma extremidade proxima encontrada para unir."))
 
-        del water_union_geom, endpoints, connector_lines
+        del water_union_join, endpoints, connector_lines
         gc.collect()
         feedback.setProgress(60)
 
@@ -1265,7 +1611,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 central_fields, QgsWkbTypes.LineString, work_crs_qgs
             )
             if central_sink is not None:
-                ds_out = _ogr2.Open(out_gpkg_path)
+                ds_out = _ogr2.Open(temp_central_path)
                 lyr_out = ds_out.GetLayer(0)
                 for feat_out in lyr_out:
                     wkt_out = feat_out.GetGeometryRef().ExportToWkt()
@@ -1286,463 +1632,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                         pass
                 ds_out = None
                 del central_sink
-        
-        feedback.pushInfo(self.tr(f"Rede ({suffix}) guardada em: {out_gpkg_path}"))
-        return out_gpkg_path
-    
-    # ------------------------------------------------------------------
-    def processAlgorithm(self, parameters, context, feedback):
-
-        # ── 0. FIXAR PROJ_DATA para o OSGeo4W — DEVE SER O PRIMEIRO PASSO
-        #
-        # O GDAL/OGR e o OSR usam o PROJ para resolver CRSs. Quando há
-        # múltiplas instalações do PROJ no sistema (OSGeo4W + pip + Anaconda),
-        # o GDAL pode encontrar um proj.db de versão errada e falhar com
-        # "no database context specified" ou "Cannot parse CRS".
-        #
-        # Solução: forçar PROJ_DATA (e o alias PROJ_LIB) para o caminho
-        # do OSGeo4W ANTES de qualquer chamada GDAL/OGR/OSR.
-        # O caminho é detectado a partir da localização do gdal.py do OSGeo4W.
-        # ---------------------------------------------------------------
-        import os as _os
-        try:
-            from osgeo import gdal as _gdal_probe, osr as _osr_probe
-            # Determinar a pasta do OSGeo4W a partir do caminho do gdal.py
-            _gdal_path = _gdal_probe.__file__                  # ex: C:\...\OSGeo4W\...\gdal.py
-            _osgeo4w_root = _gdal_path
-            for _ in range(6):                                 # subir até 6 níveis
-                _osgeo4w_root = _os.path.dirname(_osgeo4w_root)
-                _proj_db_candidate = _os.path.join(_osgeo4w_root, "share", "proj", "proj.db")
-                if _os.path.isfile(_proj_db_candidate):
-                    _proj_data_dir = _os.path.join(_osgeo4w_root, "share", "proj")
-                    _os.environ["PROJ_DATA"] = _proj_data_dir
-                    _os.environ["PROJ_LIB"]  = _proj_data_dir  # alias legacy
-                    # Reinicializar o contexto PROJ do OSR
-                    try:
-                        _osr_probe.SetPROJSearchPaths([_proj_data_dir])
-                    except Exception:
-                        pass
-                    feedback.pushInfo(self.tr(f"PROJ_DATA fixado: {_proj_data_dir}"))
-                    break
-            else:
-                feedback.pushWarning(self.tr(
-                    "Nao foi possivel localizar o proj.db do OSGeo4W automaticamente. "
-                    "Se ocorrerem erros de CRS, defina a variavel PROJ_DATA manualmente."
-                ))
-        except Exception as _e_proj:
-            feedback.pushWarning(self.tr(f"Aviso ao fixar PROJ_DATA: {_e_proj}"))
-
-        # ── 1. Recuperar parâmetros ─────────────────────────────────────
-        raster_layer  = self.parameterAsRasterLayer(parameters, self.INPUT_RASTER, context)
-        vector_layer  = self.parameterAsVectorLayer(parameters, self.INPUT_VECTOR, context)
-        gps_layer     = self.parameterAsVectorLayer(parameters, self.INPUT_GPS_TRACKS, context)
-        limits_layer  = self.parameterAsVectorLayer(parameters, self.INPUT_LIMITS, context)
-
-        buffer_dist_m    = self.parameterAsDouble(parameters, self.BUFFER_DIST, context)
-        transect_interval_m = self.parameterAsDouble(parameters, self.TRANSECT_INTERVAL, context)
-
-        output_crs_param = self.parameterAsCrs(parameters, self.OUTPUT_CRS, context)
-
-        raster_path_orig = raster_layer.source()
-        vector_path_orig = vector_layer.source()
-        tmp = context.temporaryFolder()
-
-        # ── 2. Detectar CRS e reprojetar se necessário ──────────────────
-        #
-        # FONTE DE VERDADE: os objetos QgsRasterLayer / QgsVectorLayer do QGIS.
-        # O QGIS pode ter o SRC definido na camada em memória mesmo quando o
-        # ficheiro físico não gravou os metadados de projeção. Usar rasterio/
-        # geopandas diretamente no ficheiro falha nesses casos.
-        # Rasterio e geopandas são usados apenas como fallback de último recurso.
-        # -----------------------------------------------------------------
-        feedback.pushInfo(self.tr("A verificar SRC dos dados de entrada..."))
-
-        # ---- 2a. CRS do raster — fonte primária: QgsRasterLayer -----------
-        qgs_raster_crs = raster_layer.crs()          # QgsCoordinateReferenceSystem
-        raster_crs_wkt = None
-        raster_is_geo  = None
-
-        if qgs_raster_crs.isValid():
-            raster_crs_wkt = qgs_raster_crs.toWkt()
-            raster_is_geo  = _is_geographic(raster_crs_wkt)
-            feedback.pushInfo(
-                self.tr(
-                    f"SRC do raster lido do QGIS: "
-                    f"{qgs_raster_crs.authid()} — "
-                    f"{'Geográfico (graus)' if raster_is_geo else 'Projetado (métrico)'}"
-                )
-            )
-        else:
-            # Fallback: tentar rasterio diretamente no ficheiro
-            try:
-                with rasterio.open(raster_path_orig) as src:
-                    if src.crs is not None:
-                        raster_crs_wkt = src.crs.to_wkt()
-                        raster_is_geo  = _is_geographic(raster_crs_wkt)
-                        feedback.pushInfo(
-                            self.tr(
-                                f"SRC do raster lido via rasterio: "
-                                f"{'Geográfico' if raster_is_geo else 'Projetado'}"
-                            )
-                        )
-            except Exception:
-                pass
-            if raster_crs_wkt is None:
-                feedback.pushWarning(
-                    self.tr(
-                        "AVISO: O raster não tem SRC definido nem no QGIS nem no ficheiro. "
-                        "O algoritmo tentará usar o SRC do vetor. "
-                        "Para evitar este aviso, atribua o SRC ao raster no QGIS "
-                        "(Raster → Projeções → Atribuir SRC)."
-                    )
-                )
-
-        # ---- 2b. CRS do vetor — fonte primária: QgsVectorLayer ------------
-        qgs_vector_crs = vector_layer.crs()
-        vector_epsg    = None
-        vector_is_geo  = None
-
-        if qgs_vector_crs.isValid():
-            vector_crs_wkt = qgs_vector_crs.toWkt()
-            vector_is_geo  = _is_geographic(vector_crs_wkt)
-            try:
-                auth_id = qgs_vector_crs.authid()   # ex: "EPSG:31982"
-                if auth_id.upper().startswith("EPSG:"):
-                    vector_epsg = int(auth_id.split(":")[1])
-            except Exception:
-                vector_epsg = None
-            feedback.pushInfo(
-                self.tr(
-                    f"SRC do vetor lido do QGIS: "
-                    f"{qgs_vector_crs.authid()} — "
-                    f"{'Geográfico (graus)' if vector_is_geo else 'Projetado (métrico)'}"
-                )
-            )
-        else:
-            # Fallback: tentar geopandas
-            try:
-                gdf_crs_check = _read_vector(vector_path_orig)
-                if gdf_crs_check.crs is not None:
-                    vector_epsg   = gdf_crs_check.crs.to_epsg()
-                    vector_is_geo = gdf_crs_check.crs.is_geographic
-                    feedback.pushInfo(
-                        self.tr(
-                            f"SRC do vetor lido via geopandas: EPSG:{vector_epsg}"
-                        )
-                    )
-            except Exception:
-                pass
-            if vector_is_geo is None:
-                feedback.pushWarning(
-                    self.tr(
-                        "AVISO: O vetor não tem SRC definido nem no QGIS nem no ficheiro."
-                    )
-                )
-
-        # ---- 2c. Ambos sem SRC — erro fatal --------------------------------
-        if raster_crs_wkt is None and vector_is_geo is None:
-            feedback.reportError(
-                self.tr(
-                    "ERRO: Nao foi possivel determinar o SRC do raster nem do vetor. "
-                    "Atribua o SRC correto a ambas as camadas no QGIS e tente novamente. "
-                    "Raster: clique direito → Propriedades → SRC ou Raster → Projecoes → Atribuir SRC. "
-                    "Vetor: clique direito na camada → Definir SRC da Camada."
-                ),
-                fatalError=True,
-            )
-            return {}
-
-        # ---- 2d. Determinar EPSG de trabalho (métrico) --------------------
-        #
-        # Prioridade: (1) raster métrico → usa direto
-        #             (2) raster geográfico → calcula UTM pelo centro do raster
-        #             (3) raster sem SRC + vetor métrico → usa EPSG do vetor
-        #             (4) raster sem SRC + vetor geográfico → calcula UTM pelo centroide do vetor
-
-        work_epsg = None
-
-        if raster_crs_wkt is not None and not raster_is_geo:
-            # Caso 1: raster já métrico.
-            # Fonte primária: authid do QgsCoordinateReferenceSystem (ex: "EPSG:32722").
-            # O pyproj é usado apenas se o authid não tiver prefixo EPSG.
-            work_epsg = None
-
-            # Tentativa 1: authid do QGIS (mais fiável — é o que o QGIS mostra ao utilizador)
-            try:
-                auth_id = qgs_raster_crs.authid()   # ex: "EPSG:32722"
-                if auth_id.upper().startswith("EPSG:"):
-                    work_epsg = int(auth_id.split(":")[1])
-            except Exception:
-                pass
-
-            # Tentativa 2: osr (fallback para SRCs não-EPSG)
-            if work_epsg is None:
-                try:
-                    from osgeo import osr as _osr2
-                    _srs2 = _osr2.SpatialReference()
-                    _srs2.ImportFromWkt(raster_crs_wkt)
-                    epsg_str = _srs2.GetAuthorityCode(None)
-                    if epsg_str:
-                        work_epsg = int(epsg_str)
-                except Exception:
-                    pass
-
-            # Tentativa 3: postgisSrid do QGIS (último recurso)
-            if work_epsg is None:
-                try:
-                    srid = qgs_raster_crs.postgisSrid()
-                    if srid and srid > 0:
-                        work_epsg = srid
-                except Exception:
-                    pass
-
-            if work_epsg:
-                feedback.pushInfo(
-                    self.tr(f"SRC de trabalho: EPSG:{work_epsg} (raster métrico, sem reprojeção).")
-                )
-            else:
-                # Nao conseguiu extrair EPSG numérico — usar o objecto QGIS directamente
-                # (work_crs_qgs será definido abaixo a partir de qgs_raster_crs)
-                feedback.pushWarning(
-                    self.tr(
-                        f"Nao foi possivel extrair o codigo EPSG numerico do SRC do raster "
-                        f"({qgs_raster_crs.authid()}). O SRC QGIS sera usado directamente. "
-                        f"Verifique os resultados."
-                    )
-                )
-            raster_path = raster_path_orig
-
-        elif raster_crs_wkt is not None and raster_is_geo:
-            # Caso 2: raster geográfico → reprojetar para UTM
-            lon, lat  = _get_raster_center_lonlat(raster_path_orig)
-            work_epsg = _auto_utm_epsg(lon, lat)
-            feedback.pushInfo(
-                self.tr(
-                    f"SRC do raster é geográfico. "
-                    f"Reprojetando para EPSG:{work_epsg} (UTM)..."
-                )
-            )
-            raster_path = _reproject_raster_to_metric(raster_path_orig, work_epsg, tmp)
-
-        elif vector_is_geo is not None and not vector_is_geo and vector_epsg:
-            # Caso 3: raster sem SRC, vetor já métrico
-            work_epsg = vector_epsg
-            feedback.pushWarning(
-                self.tr(
-                    f"Raster sem SRC. Usando SRC do vetor (EPSG:{work_epsg}) como SRC de trabalho. "
-                    f"Atribua o SRC real ao raster para evitar este aviso."
-                )
-            )
-            raster_path = raster_path_orig
-
-        else:
-            # Caso 4: raster sem SRC, vetor geográfico → UTM pelo centroide do vetor
-            try:
-                gdf_tmp = _read_vector(vector_path_orig)
-                cx = gdf_tmp.geometry.unary_union.centroid.x
-                cy = gdf_tmp.geometry.unary_union.centroid.y
-                work_epsg = _auto_utm_epsg(cx, cy)
-            except Exception:
-                feedback.reportError(
-                    self.tr(
-                        "ERRO: Não foi possível calcular o UTM automático. "
-                        "Atribua o SRC correto ao raster e tente novamente."
-                    ),
-                    fatalError=True,
-                )
-                return {}
-            feedback.pushWarning(
-                self.tr(
-                    f"Raster sem SRC e vetor geográfico. "
-                    f"Usando EPSG:{work_epsg} (UTM auto pelo centroide do vetor) "
-                    f"como SRC de trabalho."
-                )
-            )
-            raster_path = raster_path_orig
-
-        # ---- 2e. Reprojetar vetor se necessário ---------------------------
-        needs_vector_reproject = False
-        if vector_is_geo is True:
-            needs_vector_reproject = True
-        elif work_epsg and vector_epsg and vector_epsg != work_epsg:
-            needs_vector_reproject = True
-
-        if needs_vector_reproject:
-            feedback.pushInfo(
-                self.tr(
-                    f"SRC do vetor (EPSG:{vector_epsg}) difere do SRC de trabalho "
-                    f"(EPSG:{work_epsg}). A reprojetar vetor..."
-                )
-            )
-            vector_path = _reproject_vector_to_metric(vector_path_orig, work_epsg, tmp)
-        else:
-            feedback.pushInfo(
-                self.tr(
-                    f"SRC do vetor compativel com SRC de trabalho (EPSG:{work_epsg}). "
-                    f"Sem necessidade de reprojecao."
-                )
-            )
-            vector_path = vector_path_orig
-
-        # Leitura do GeoDataFrame do vetor (para uso nas etapas seguintes)
-        gdf_check = _read_vector(vector_path)
-
-        feedback.pushInfo(
-            self.tr(
-                f"Parâmetros de distância — Buffer: {buffer_dist_m} m | "
-                f"Transecto: {transect_interval_m} m"
-            )
-        )
-
-        # ── PRÉ-PROCESSAMENTO DO VETOR: preencher buracos (ilhas) ───────
-        feedback.pushInfo(self.tr("A preencher buracos (ilhas) no vetor de agua..."))
-
-        gdf_fill = _read_vector(vector_path)[["geometry"]].copy()
-
-        # NOVO: Fechamento morfológico vetorial (Closing) em vez de fill_holes.
-        # Usa a distância marginal (buffer_dist_m) para fechar canais menores e manter ilhas grandes.
-        gdf_fill["geometry"] = gdf_fill["geometry"].buffer(buffer_dist_m).buffer(-buffer_dist_m)
-
-        gdf_fill = gdf_fill[~gdf_fill.geometry.is_empty].reset_index(drop=True)
-
-        temp_filled_path = os.path.join(tmp, "temp_water_filled.gpkg")
-        gdf_fill.to_file(temp_filled_path, driver="GPKG")
-        del gdf_fill
-        gc.collect()
-
-        gdf_fill["geometry"] = gdf_fill["geometry"].apply(_fill_holes)
-        gdf_fill = gdf_fill[~gdf_fill.geometry.is_empty].reset_index(drop=True)
-
-        temp_filled_path = os.path.join(tmp, "temp_water_filled.gpkg")
-        gdf_fill.to_file(temp_filled_path, driver="GPKG")
-        del gdf_fill
-        gc.collect()
-
-        # vector_path_for_skel = vetor sem ilhas (para skeletonize e centrais)
-        # vector_path          = vetor original (para clip das transversais)
-        vector_path_for_skel = temp_filled_path
-        feedback.pushInfo(self.tr("  Buracos preenchidos. Usando vetor preenchido para esqueletonizacao."))
-
-        # SRC QGIS de trabalho (usado no merge e na saída)
-        # Prioridade: (1) EPSG numérico extraído → constrói por código
-        #             (2) QgsRasterLayer.crs() → já é um objecto válido
-        #             (3) CRS do projecto QGIS → último recurso
-        if work_epsg:
-            work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
-        elif qgs_raster_crs.isValid():
-            work_crs_qgs = qgs_raster_crs
-            # Tentar recuperar o EPSG a partir do objecto QGIS como inteiro
-            try:
-                srid = qgs_raster_crs.postgisSrid()
-                if srid and srid > 0:
-                    work_epsg = srid
-                    work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
-            except Exception:
-                pass
-        else:
-            work_crs_qgs = context.project().crs()
-
-        feedback.pushInfo(
-            self.tr(f"SRC QGIS de trabalho definido: {work_crs_qgs.authid()}")
-        )
-
-        # ── A. ROTAS CENTRAIS ───────────────────────────────────────────
-        #
-        # ESTRATÉGIA DE MEMÓRIA:
-        #
-        # O skeletonize() precisa da imagem INTEIRA para gerar um esqueleto
-        # contínuo. Processar em blocos independentes cria descontinuidades
-        # nas bordas — por isso não é possível usar tiling directo.
-        #
-        # Estratégia adoptada (3 fases):
-        #
-        # FASE 1 — Quantização: ler o raster em blocos e gravar um raster
-        #   temporário uint8 comprimido. Reduz o tamanho antes de carregar
-        #   tudo na RAM (rasters float32/int16 passam para 1 byte/pixel).
-        #
-        # FASE 2 — Esqueletonização: carregar o raster uint8 comprimido
-        #   inteiro em RAM como array bool (menor pegada possível),
-        #   esqueletonizar, converter para uint8 e libertar o bool.
-        #
-        # FASE 3 — Gravação: gravar o esqueleto uint8 para disco em blocos
-        #   e libertar o array da memória antes de avançar.
-        #
-        # Pegada máxima de RAM durante a fase 2 (pior caso):
-        #   raster 500 MB × 1 byte/pixel (uint8 quantizado)
-        #   + array bool = mesma dimensão (~500 MB)
-        #   + array uint8 do esqueleto (~500 MB)
-        #   Total estimado: ~1.5 GB — aceitável para 8+ GB de RAM.
-        #
-        # Para rasters > 1 GB recomenda-se usar um SRC com tiles menores
-        # ou dividir a área de estudo em sub-regiões antes de processar.
-        # ---------------------------------------------------------------
-        feedback.pushInfo(self.tr("A gerar rotas centrais — fase 1/3: a quantizar raster..."))
-
-        temp_uint8_path = os.path.join(tmp, "temp_uint8.tif")
-        temp_skel_path  = os.path.join(tmp, "temp_skeleton.tif")
-
-        # ── RASTERIZAR O VETOR PREENCHIDO ──────────────────────────────
-        # O INPUT_RASTER fornecido pelo utilizador foi gerado a partir do
-        # vetor original COM ilhas — o esqueleto contornaria as ilhas.
-        # Solução: rasterizar o vetor PREENCHIDO (sem ilhas) com a mesma
-        # resolução, extensão e CRS do raster original, e usar esse raster
-        # para o skeletonize e linhas centrais.
-        # O raster original continua a ser usado apenas para determinar
-        # a grade (resolução, extensão, CRS).
-        # ---------------------------------------------------------------
-        feedback.pushInfo(self.tr("  Rasterizando vetor preenchido (sem ilhas)..."))
-
-        temp_raster_filled_path = os.path.join(tmp, "temp_raster_filled.tif")
-        
-        with rasterio.open(raster_path) as src_ref:
-            ref_transform = src_ref.transform
-            ref_crs       = src_ref.crs
-            ref_height    = src_ref.height
-            ref_width     = src_ref.width
-            ref_dtype     = "uint8"
-
-        # Rasterizar usando rasterio.features.rasterize
-        from rasterio.features import rasterize as rio_rasterize
-        from shapely.geometry  import mapping as shp_mapping
-
-        gdf_rast = _read_vector(vector_path_for_skel)[["geometry"]]
-        shapes_for_rast = [(shp_mapping(geom), 1) for geom in gdf_rast.geometry
-                           if geom is not None and not geom.is_empty]
-        del gdf_rast
-        gc.collect()
-
-        filled_arr = rio_rasterize(
-            shapes_for_rast,
-            out_shape=(ref_height, ref_width),
-            transform=ref_transform,
-            fill=0,
-            dtype=ref_dtype,
-            all_touched=False,
-        )
-        del shapes_for_rast
-
-        profile_filled = {
-            "driver":    "GTiff",
-            "dtype":     ref_dtype,
-            "count":     1,
-            "height":    ref_height,
-            "width":     ref_width,
-            "crs":       ref_crs,
-            "transform": ref_transform,
-            "compress":  "lzw",
-            "tiled":     True,
-            "blockxsize": 512,
-            "blockysize": 512,
-        }
-        with rasterio.open(temp_raster_filled_path, "w", **profile_filled) as dst_fill:
-            dst_fill.write(filled_arr, 1)
-        del filled_arr
-        gc.collect()
-        feedback.pushInfo(self.tr("  Raster preenchido gerado. A usar para skeletonize."))
-
-        # Usar o raster preenchido como fonte para o skeletonize
-        raster_path_for_skel = raster_path
-        
 
         # central_routes = caminho do gpkg para uso nas etapas seguintes
         central_routes = temp_central_path
@@ -1811,10 +1700,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         # obter linhas contínuas. Sem isto, o loop itera sobre fragmentos
         # curtos e gera transversais com densidade errada.
         feedback.pushInfo(self.tr("  Carregando e unindo rotas centrais para transversais..."))
-
-        # Ler a rede temporária (criada sem buracos) para orientar as transversais perfeitamente
-        cent_gdf = gpd.read_file(temp_central_temp_path)
-        
         raw_central_lines = []
         ds_c = ogr.Open(central_routes)
         lyr_c = ds_c.GetLayer(0)
@@ -1849,19 +1734,10 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             f"  {len(central_line_list)} linhas centrais continuas para transversais."
         ))
 
-        # ── Carregar polígonos de água ─────────────────────────────────
-        # water_union_filled: vetor SEM ilhas → usado para calcular a
-        #   distância ao limite e gerar perpendiculares correctas.
-        # water_union_orig:   vetor ORIGINAL (com ilhas) → clip final
-        #   das transversais, preservando as ilhas no resultado.
-        water_mask_filled = _read_vector(vector_path_for_skel)[["geometry"]]
-        water_union_filled = water_mask_filled.geometry.unary_union
-        del water_mask_filled
-        gc.collect()
-
-        water_mask_orig = _read_vector(vector_path)[["geometry"]]
-        water_union_orig = water_mask_orig.geometry.unary_union
-        del water_mask_orig
+        # ── Carregar polígono de água ────────────────────────────────────
+        water_mask_gdf = _read_vector(vector_path)[["geometry"]]
+        water_union    = water_mask_gdf.geometry.unary_union
+        del water_mask_gdf
         gc.collect()
 
         # ── Criar datasource OGR ─────────────────────────────────────────
@@ -1932,10 +1808,9 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             # primeiro intervalo para não colocar transversais nas pontas
             dist = transect_interval_m / 2.0
             while dist < length:
-                perp = _make_perpendicular_v2(line, dist, water_union_filled)
+                perp = _make_perpendicular_v2(line, dist, water_union)
                 if perp is not None:
-                    # Clip com vetor ORIGINAL (com ilhas) — preserva ilhas no resultado
-                    clipped = perp.intersection(water_union_orig)
+                    clipped = perp.intersection(water_union)
                     if not clipped.is_empty and clipped.length > 1.0:
                         # Extrair todos os segmentos de linha do resultado do clip
                         candidates = []
@@ -1979,7 +1854,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         lyr_t.CommitTransaction()
         ds_t = None
-        del central_line_list, water_union_filled, water_union_orig
+        del central_line_list, water_union
         gc.collect()
 
         feedback.pushInfo(self.tr(f"Transversais concluidas: {t_count} rotas geradas."))
@@ -2020,25 +1895,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         gc.collect()
         feedback.setProgress(90)
 
-        # ── QUEBRAR LINHAS NAS INTERSEÇÕES (Split with Lines) ─────────────
-        feedback.pushInfo(self.tr("A quebrar linhas nas interseções..."))
-        
-        # O algoritmo 'native:splitwithlines' quebra a rede por ela mesma.
-        # Isto preserva automaticamente os atributos originais (como 'source' = central/marginal/transversal)
-        split_result = processing.run(
-            "native:splitwithlines",
-            {
-                "INPUT": merged_network['OUTPUT'], # A sua camada combinada
-                "LINES": merged_network['OUTPUT'], # Quebra usando a própria camada
-                "OUTPUT": "memory:"
-            },
-            context=context,
-            feedback=feedback,
-            is_child_algorithm=True
-        )
-        
-        network_to_export = split_result['OUTPUT']
-    
         # ── E. REPROJETAR PARA O SRC DE SAÍDA (TEMPORARY_OUTPUT) ────────
         # O native:reprojectlayer com destino ficheiro preserva os FIDs
         # originais — quando há features de 3 camadas mescladas os FIDs
