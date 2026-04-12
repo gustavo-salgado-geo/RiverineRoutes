@@ -345,6 +345,38 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+    def _extrair_rede(self, raster_input_path, out_gpkg_path, tmp_folder, buffer_dist_m, work_crs_qgs, water_union_geom, feedback, suffix=""):
+        """
+        Gera o esqueleto, faz o rastreio do grafo de pixels, suaviza, une e exporta para GPKG.
+        """
+        import os, gc, rasterio
+        from osgeo import ogr, osr
+        from shapely.geometry import LineString as ShpLineString, Point as ShpPoint
+        from shapely.ops import linemerge
+        import numpy as np
+        
+        feedback.pushInfo(self.tr(f"A iniciar extracção de rede ({suffix})..."))
+
+        # Nomes de arquivos temporários exclusivos para esta rodada
+        temp_uint8_path = os.path.join(tmp_folder, f"temp_uint8_{suffix}.tif")
+        temp_skel_path  = os.path.join(tmp_folder, f"temp_skeleton_{suffix}.tif")
+
+        # =====================================================================
+        # ✂️ COLE AQUI TODO O BLOCO GIGANTE DO SEU CÓDIGO ORIGINAL QUE VAI DESDE:
+        # "# FASE 1: ler em blocos, gravar uint8 comprimido"
+        # ATÉ (E INCLUINDO) A PARTE DE:
+        # "# ── UNIÃO DE EXTREMIDADES PRÓXIMAS DENTRO DO POLÍGONO DE ÁGUA ──"
+        # =====================================================================
+        
+        # [ATENÇÃO AOS SEGUINTES AJUSTES DENTRO DO CÓDIGO COLADO]:
+        # 1. Troque 'raster_path_for_skel' por 'raster_input_path'
+        # 2. Troque 'temp_central_path' por 'out_gpkg_path'
+        # 3. Na etapa de "UNIÃO DE EXTREMIDADES", certifique-se de usar 'water_union_geom' 
+        #    em vez da variável global water_union_join que existia antes.
+        
+        feedback.pushInfo(self.tr(f"Rede ({suffix}) guardada em: {out_gpkg_path}"))
+        return out_gpkg_path
+    
     # ------------------------------------------------------------------
     def processAlgorithm(self, parameters, context, feedback):
 
@@ -650,32 +682,20 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         )
 
         # ── PRÉ-PROCESSAMENTO DO VETOR: preencher buracos (ilhas) ───────
-        #
-        # O vetor de água pode ter "furos" — polígonos com anéis interiores
-        # representando ilhas. Para o skeletonize e para as linhas centrais,
-        # precisamos de polígonos PREENCHIDOS (sem ilhas), caso contrário o
-        # esqueleto contorna as ilhas em vez de passar pelo centro do canal.
-        #
-        # vector_path_filled → usado para: rasterizar, skeletonize, centrais,
-        #                       marginais, e como base das transversais.
-        # vector_path_orig   → usado para: clip final das transversais.
-        #                       (as transversais são cortadas pelo vetor
-        #                        ORIGINAL, preservando as ilhas no resultado)
-        # ---------------------------------------------------------------
         feedback.pushInfo(self.tr("A preencher buracos (ilhas) no vetor de agua..."))
 
         gdf_fill = _read_vector(vector_path)[["geometry"]].copy()
 
-        def _fill_holes(geom):
-            """Remove todos os anéis interiores de uma geometria Shapely."""
-            from shapely.geometry import Polygon, MultiPolygon
-            if geom is None or geom.is_empty:
-                return geom
-            if geom.geom_type == "Polygon":
-                return Polygon(geom.exterior)
-            if geom.geom_type == "MultiPolygon":
-                return MultiPolygon([Polygon(p.exterior) for p in geom.geoms])
-            return geom
+        # NOVO: Fechamento morfológico vetorial (Closing) em vez de fill_holes.
+        # Usa a distância marginal (buffer_dist_m) para fechar canais menores e manter ilhas grandes.
+        gdf_fill["geometry"] = gdf_fill["geometry"].buffer(buffer_dist_m).buffer(-buffer_dist_m)
+
+        gdf_fill = gdf_fill[~gdf_fill.geometry.is_empty].reset_index(drop=True)
+
+        temp_filled_path = os.path.join(tmp, "temp_water_filled.gpkg")
+        gdf_fill.to_file(temp_filled_path, driver="GPKG")
+        del gdf_fill
+        gc.collect()
 
         gdf_fill["geometry"] = gdf_fill["geometry"].apply(_fill_holes)
         gdf_fill = gdf_fill[~gdf_fill.geometry.is_empty].reset_index(drop=True)
@@ -808,7 +828,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr("  Raster preenchido gerado. A usar para skeletonize."))
 
         # Usar o raster preenchido como fonte para o skeletonize
-        raster_path_for_skel = temp_raster_filled_path
+        raster_path_for_skel = raster_path
         
         # FASE 1: ler em blocos, gravar uint8 comprimido
         with rasterio.open(raster_path_for_skel) as src:
@@ -1803,6 +1823,10 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         # obter linhas contínuas. Sem isto, o loop itera sobre fragmentos
         # curtos e gera transversais com densidade errada.
         feedback.pushInfo(self.tr("  Carregando e unindo rotas centrais para transversais..."))
+
+        # Ler a rede temporária (criada sem buracos) para orientar as transversais perfeitamente
+        cent_gdf = gpd.read_file(temp_central_temp_path)
+        
         raw_central_lines = []
         ds_c = ogr.Open(central_routes)
         lyr_c = ds_c.GetLayer(0)
@@ -2008,6 +2032,25 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         gc.collect()
         feedback.setProgress(90)
 
+        # ── QUEBRAR LINHAS NAS INTERSEÇÕES (Split with Lines) ─────────────
+        feedback.pushInfo(self.tr("A quebrar linhas nas interseções..."))
+        
+        # O algoritmo 'native:splitwithlines' quebra a rede por ela mesma.
+        # Isto preserva automaticamente os atributos originais (como 'source' = central/marginal/transversal)
+        split_result = processing.run(
+            "native:splitwithlines",
+            {
+                "INPUT": merged_network['OUTPUT'], # A sua camada combinada
+                "LINES": merged_network['OUTPUT'], # Quebra usando a própria camada
+                "OUTPUT": "memory:"
+            },
+            context=context,
+            feedback=feedback,
+            is_child_algorithm=True
+        )
+        
+        network_to_export = split_result['OUTPUT']
+    
         # ── E. REPROJETAR PARA O SRC DE SAÍDA (TEMPORARY_OUTPUT) ────────
         # O native:reprojectlayer com destino ficheiro preserva os FIDs
         # originais — quando há features de 3 camadas mescladas os FIDs
