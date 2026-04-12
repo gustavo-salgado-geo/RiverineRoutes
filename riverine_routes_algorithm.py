@@ -1652,18 +1652,19 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             norm = (dx**2 + dy**2) ** 0.5
             if norm < 1e-10:
                 return None
-
+        
             cp = line_geom.interpolate(dist_along)
             cx, cy = cp.x, cp.y
-
-            from shapely.geometry import Point as ShpPoint
-            center_pt = ShpPoint(cx, cy)
-            boundary  = water_poly.boundary
-            dist_to_boundary = center_pt.distance(boundary)
-            half_len = max(50.0, dist_to_boundary * 1.5)
-
+        
+            # Usar a diagonal da bounding box do polígono de água como half_len.
+            # Garante que a linha bruta sempre atravessa as duas margens,
+            # independente do ângulo ou largura do rio.
+            # O clip por water_poly.intersection() resolve o comprimento final.
+            bounds = water_poly.bounds  # (minx, miny, maxx, maxy)
+            half_len = ((bounds[2] - bounds[0])**2 + (bounds[3] - bounds[1])**2) ** 0.5
+        
             px, py = -dy / norm, dx / norm
-
+        
             return ShpLineString([
                 (cx - px * half_len, cy - py * half_len),
                 (cx + px * half_len, cy + py * half_len),
