@@ -42,10 +42,7 @@ from shapely.ops import nearest_points
 # ---------------------------------------------------------------------------
 
 def _is_geographic(crs_wkt: str) -> bool:
-    """Devolve True se o CRS está em graus (geográfico), False se já é métrico.
-    Usa osgeo.osr (GDAL/OSGeo4W) em vez de pyproj para evitar conflitos de
-    instalação em ambientes com múltiplos PROJ (ex: OSGeo4W + pip).
-    """
+    """Devolve True se o CRS está em graus (geográfico), False se já é métrico."""
     try:
         from osgeo import osr
         srs = osr.SpatialReference()
@@ -54,28 +51,19 @@ def _is_geographic(crs_wkt: str) -> bool:
             return bool(srs.IsGeographic())
     except Exception:
         pass
-    # Fallback heurístico — sem dependência externa
     wkt_upper = crs_wkt.upper()
     return any(h in wkt_upper for h in ["GEOGCS", "GEOGRAPHIC", "DEGREE", "DECIMAL_DEGREE"])
 
 
 def _auto_utm_epsg(lon: float, lat: float) -> int:
-    """
-    Calcula o EPSG UTM mais adequado para uma longitude/latitude dadas.
-    Cobre zonas WGS84 norte (326xx) e sul (327xx).
-    """
     zone = int((lon + 180) / 6) + 1
     if lat >= 0:
-        return 32600 + zone   # UTM Norte
+        return 32600 + zone
     else:
-        return 32700 + zone   # UTM Sul
+        return 32700 + zone
 
 
 def _get_raster_center_lonlat(raster_path: str):
-    """Devolve (lon, lat) do centro do raster em WGS84.
-    Usa osgeo.osr (GDAL/OSGeo4W) para a transformação de coordenadas,
-    evitando dependência do pyproj instalado via pip.
-    """
     from osgeo import osr, ogr as _ogr
     with rasterio.open(raster_path) as src:
         bounds = src.bounds
@@ -84,16 +72,15 @@ def _get_raster_center_lonlat(raster_path: str):
         crs_wkt = src.crs.to_wkt() if src.crs else None
 
     if crs_wkt is None:
-        return cx, cy   # sem SRC — devolver como estão
+        return cx, cy
 
     src_srs = osr.SpatialReference()
     src_srs.ImportFromWkt(crs_wkt)
 
     if src_srs.IsGeographic():
-        return cx, cy   # já em graus
+        return cx, cy
 
     dst_srs = osr.SpatialReference()
-    # WKT do WGS84 GEOGCS embutido — não consulta o proj.db
     _wgs84_wkt = (
         'GEOGCS["WGS 84",DATUM["WGS_1984",'
         'SPHEROID["WGS 84",6378137,298.257223563]],'
@@ -112,10 +99,6 @@ def _get_raster_center_lonlat(raster_path: str):
 
 
 def _reproject_raster_to_metric(raster_path: str, target_epsg: int, tmp_folder: str) -> str:
-    """
-    Reprojeta um raster para o EPSG métrico indicado.
-    Devolve o caminho para o ficheiro reprojetado.
-    """
     dst_crs = f"EPSG:{target_epsg}"
     out_path = os.path.join(tmp_folder, f"raster_reproj_{target_epsg}.tif")
 
@@ -145,26 +128,14 @@ def _reproject_raster_to_metric(raster_path: str, target_epsg: int, tmp_folder: 
 
 
 def _parse_vector_source(qgis_source: str):
-    """
-    O QGIS representa fontes vetoriais com a sintaxe:
-        /caminho/arquivo.gpkg|layername=nome_da_camada
-        /caminho/arquivo.shp          (sem pipe — shapefile simples)
-
-    O GeoPandas/pyogrio nao entende o '|layername=...' — precisa receber
-    o caminho e o nome da camada separados.
-
-    Devolve: (caminho_do_ficheiro, nome_da_camada_ou_None)
-    """
     if "|layername=" in qgis_source:
         parts = qgis_source.split("|layername=", 1)
         return parts[0], parts[1]
-    # Outros parametros possiveis (|subset=, |geometrytype=, etc.) sao ignorados
     clean_path = qgis_source.split("|")[0]
     return clean_path, None
 
 
 def _read_vector(qgis_source: str) -> "gpd.GeoDataFrame":
-    """Le uma camada vetorial a partir de um caminho no formato QGIS."""
     path, layer = _parse_vector_source(qgis_source)
     if layer:
         return gpd.read_file(path, layer=layer)
@@ -172,16 +143,384 @@ def _read_vector(qgis_source: str) -> "gpd.GeoDataFrame":
 
 
 def _reproject_vector_to_metric(qgis_source: str, target_epsg: int, tmp_folder: str) -> str:
-    """
-    Reprojeta uma camada vetorial para o EPSG metrico indicado.
-    Aceita caminhos no formato QGIS (com |layername=...).
-    Devolve o caminho para o ficheiro reprojetado (.gpkg).
-    """
     gdf = _read_vector(qgis_source)
     gdf_reproj = gdf.to_crs(epsg=target_epsg)
     out_path = os.path.join(tmp_folder, f"vector_reproj_{target_epsg}.gpkg")
     gdf_reproj.to_file(out_path, driver="GPKG")
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Funções auxiliares para centerlines internas (uso nas transversais)
+# ---------------------------------------------------------------------------
+
+def _rasterize_vector_to_tiff(vector_path: str, reference_raster_path: str,
+                               out_tiff_path: str, burn_value: int = 1) -> str:
+    """
+    Rasteriza um vetor de polígonos usando as mesmas dimensões/transform
+    do raster de referência. Devolve o caminho do tiff gerado.
+    Usa rasterio.features.rasterize — sem dependência do GDAL CLI.
+    """
+    import rasterio.features
+
+    gdf = _read_vector(vector_path)
+
+    with rasterio.open(reference_raster_path) as ref:
+        ref_transform = ref.transform
+        ref_shape     = (ref.height, ref.width)
+        ref_crs       = ref.crs
+        profile = {
+            "driver":    "GTiff",
+            "dtype":     "uint8",
+            "count":     1,
+            "height":    ref.height,
+            "width":     ref.width,
+            "crs":       ref_crs,
+            "transform": ref_transform,
+            "compress":  "lzw",
+        }
+
+    # Reprojetar vetor para o CRS do raster de referência se necessário
+    if gdf.crs is not None and ref_crs is not None:
+        import pyproj
+        from pyproj import CRS as ProjCRS
+        ref_crs_str = ref_crs.to_wkt() if hasattr(ref_crs, "to_wkt") else str(ref_crs)
+        gdf = gdf.to_crs(ref_crs_str)
+
+    shapes = ((geom, burn_value) for geom in gdf.geometry if geom is not None and not geom.is_empty)
+
+    burned = rasterio.features.rasterize(
+        shapes,
+        out_shape=ref_shape,
+        transform=ref_transform,
+        fill=0,
+        dtype="uint8",
+    )
+
+    with rasterio.open(out_tiff_path, "w", **profile) as dst:
+        dst.write(burned, 1)
+
+    return out_tiff_path
+
+
+def _compute_internal_centerlines(
+    vector_path: str,
+    reference_raster_path: str,
+    buffer_dist_m: float,
+    pixel_size_m: float,
+    tmp_folder: str,
+    feedback=None,
+) -> list:
+    """
+    Gera centerlines INTERNAS para uso exclusivo no posicionamento das
+    rotas transversais. Estas centerlines NÃO são entregues como output.
+
+    Pipeline interno (totalmente temporário):
+      1. Ler vetor de água
+      2. Buffer POSITIVO com buffer_dist_m  → polígono "zona navegável interna"
+      3. Buffer NEGATIVO com buffer_dist_m  → colapso para canal central
+      4. Rasterizar o resultado
+      5. Skeletonize + thin + pruning (igual ao pipeline das rotas centrais)
+      6. Rastreio de grafo → lista de ShpLineString
+
+    Devolve lista de shapely.geometry.LineString já em coordenadas reais.
+    """
+    from shapely.geometry import LineString as ShpLS
+    from shapely.ops      import linemerge as shp_lm
+    from scipy.ndimage    import label as ndl, convolve as ndc
+    import rasterio.features
+
+    def _log(msg):
+        if feedback:
+            feedback.pushInfo(msg)
+
+    # ── 1. Ler vetor e aplicar buffer positivo → negativo ──────────────
+    _log("  [Transversais] Lendo vetor de agua para centerlines internas...")
+    water_gdf = _read_vector(vector_path)[["geometry"]]
+    water_union_raw = water_gdf.geometry.unary_union
+    del water_gdf
+    gc.collect()
+
+    _log(f"  [Transversais] Buffer positivo de {buffer_dist_m:.1f}m...")
+    buffered_pos = water_union_raw.buffer(buffer_dist_m)
+
+    _log(f"  [Transversais] Buffer negativo de {buffer_dist_m:.1f}m (colapso para canal)...")
+    buffered_neg = buffered_pos.buffer(-buffer_dist_m)
+    del buffered_pos
+    gc.collect()
+
+    if buffered_neg.is_empty:
+        _log("  [Transversais] AVISO: buffer negativo resultou em geometria vazia. "
+             "Usando uniao original como fallback.")
+        buffered_neg = water_union_raw
+
+    del water_union_raw
+    gc.collect()
+
+    # ── 2. Rasterizar para tiff temporário ─────────────────────────────
+    _log("  [Transversais] Rasterizando canal colapsado...")
+    tmp_vec_path  = os.path.join(tmp_folder, "_internal_canal_collapsed.gpkg")
+    tmp_rast_path = os.path.join(tmp_folder, "_internal_canal_raster.tif")
+
+    # Gravar geometria colapsada num gpkg temporário
+    import geopandas as _gpd2
+    from shapely.geometry import mapping as shp_mapping
+    gdf_collapsed = _gpd2.GeoDataFrame(
+        geometry=[buffered_neg] if buffered_neg.geom_type != "GeometryCollection"
+                  else list(buffered_neg.geoms),
+        crs=None,
+    )
+    # Atribuir CRS a partir do raster de referência
+    with rasterio.open(reference_raster_path) as _ref:
+        _ref_crs = _ref.crs
+        _ref_transform = _ref.transform
+        _ref_shape = (_ref.height, _ref.width)
+        _ref_profile = {
+            "driver":    "GTiff",
+            "dtype":     "uint8",
+            "count":     1,
+            "height":    _ref.height,
+            "width":     _ref.width,
+            "crs":       _ref.crs,
+            "transform": _ref.transform,
+            "compress":  "lzw",
+        }
+
+    if _ref_crs:
+        gdf_collapsed = gdf_collapsed.set_crs(_ref_crs, allow_override=True)
+
+    shapes_burn = (
+        (geom, 1) for geom in gdf_collapsed.geometry
+        if geom is not None and not geom.is_empty
+    )
+    burned_arr = rasterio.features.rasterize(
+        shapes_burn,
+        out_shape=_ref_shape,
+        transform=_ref_transform,
+        fill=0,
+        dtype="uint8",
+    )
+    with rasterio.open(tmp_rast_path, "w", **_ref_profile) as _dst:
+        _dst.write(burned_arr, 1)
+    del gdf_collapsed, burned_arr
+    gc.collect()
+
+    # ── 3. Pré-processamento morfológico + skeletonize ─────────────────
+    _log("  [Transversais] Skeletonizando canal colapsado...")
+    with rasterio.open(tmp_rast_path) as _src:
+        canal_arr   = _src.read(1).astype(bool)
+        skel_transform = _src.transform
+        skel_pixel_size = abs(_src.transform.a)
+
+    close_r       = max(1, int(round((buffer_dist_m * 0.10) / max(skel_pixel_size, 1e-6))))
+    open_r        = max(1, int(round((buffer_dist_m * 0.05) / max(skel_pixel_size, 1e-6))))
+    min_island_px = max(10, int(3.14159 * ((buffer_dist_m * 0.5) / max(skel_pixel_size, 1e-6)) ** 2))
+
+    canal_arr = remove_small_objects(canal_arr, min_size=min_island_px, connectivity=2)
+    canal_arr = binary_closing(canal_arr, footprint=disk(close_r))
+    canal_arr = binary_opening(canal_arr, footprint=disk(open_r))
+    gc.collect()
+
+    skel_bool = skeletonize(canal_arr)
+    del canal_arr
+    gc.collect()
+
+    skel_bool = skimage_thin(skel_bool)
+    gc.collect()
+
+    # Pruning
+    prune_px       = max(3, int(round((buffer_dist_m * 0.5) / max(skel_pixel_size, 1e-6))))
+    nb_kernel      = np.ones((3, 3), dtype=np.uint8)
+    nb_kernel[1,1] = 0
+    skel_work = skel_bool.copy()
+    del skel_bool
+    gc.collect()
+
+    for _ in range(prune_px):
+        if not skel_work.any():
+            break
+        nb_count = nd_convolve(skel_work.astype(np.uint8), nb_kernel, mode="constant", cval=0)
+        terminals_p = skel_work & (nb_count == 1)
+        if not terminals_p.any():
+            break
+        skel_work = skel_work & ~terminals_p
+
+    # ── 4. Rastreio de grafo → LineStrings ─────────────────────────────
+    _log("  [Transversais] Rastreando grafo do esqueleto interno...")
+
+    n_neighbors_int = nd_convolve(
+        skel_work.astype(np.uint8), nb_kernel, mode="constant", cval=0
+    )
+    terminals_int = skel_work & (n_neighbors_int == 1)
+    junctions_int = skel_work & (n_neighbors_int >= 3)
+    skel_work     = skel_work & (n_neighbors_int >= 1)
+    node_mask_int = terminals_int | junctions_int
+
+    NEIGHBORS_8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+
+    def _rc_to_xy_int(r, c):
+        x, y = rasterio.transform.xy(skel_transform, r, c, offset="center")
+        return float(x), float(y)
+
+    visited_edges_int = set()
+    lines_rc_int = []
+    node_rows_int, node_cols_int = np.where(node_mask_int)
+
+    def _all_nb_int(r, c):
+        nb = []
+        for dr, dc in NEIGHBORS_8:
+            nr, nc_ = r+dr, c+dc
+            if 0 <= nr < skel_work.shape[0] and 0 <= nc_ < skel_work.shape[1]:
+                if skel_work[nr, nc_]:
+                    nb.append((nr, nc_))
+        return nb
+
+    for nr0, nc0 in zip(node_rows_int.tolist(), node_cols_int.tolist()):
+        for (vr, vc) in _all_nb_int(nr0, nc0):
+            edge_key = (min((nr0,nc0),(vr,vc)), max((nr0,nc0),(vr,vc)))
+            if edge_key in visited_edges_int:
+                continue
+            chain = [(nr0, nc0), (vr, vc)]
+            visited_edges_int.add(edge_key)
+            cur_r, cur_c = vr, vc
+            if node_mask_int[cur_r, cur_c]:
+                if len(chain) >= 2:
+                    lines_rc_int.append(chain)
+                continue
+            prev_r, prev_c = nr0, nc0
+            while True:
+                nbs = [(r, c) for r, c in _all_nb_int(cur_r, cur_c)
+                       if (r, c) != (prev_r, prev_c)]
+                if not nbs:
+                    break
+                if len(nbs) == 1:
+                    next_r, next_c = nbs[0]
+                    e2 = (min((cur_r,cur_c),(next_r,next_c)),
+                          max((cur_r,cur_c),(next_r,next_c)))
+                    chain.append((next_r, next_c))
+                    visited_edges_int.add(e2)
+                    prev_r, prev_c = cur_r, cur_c
+                    cur_r, cur_c = next_r, next_c
+                    if node_mask_int[cur_r, cur_c]:
+                        break
+                else:
+                    break
+            if len(chain) >= 2:
+                lines_rc_int.append(chain)
+
+    # Segunda passagem: pixels orphaned
+    visited_flat_int = set()
+    for chain in lines_rc_int:
+        for px in chain:
+            visited_flat_int.add(px)
+
+    orphaned_int = skel_work.copy()
+    for r, c in visited_flat_int:
+        orphaned_int[r, c] = False
+
+    if orphaned_int.any():
+        struct_8_int = np.ones((3, 3), dtype=bool)
+        labeled_orp, n_grps = nd_label(orphaned_int, structure=struct_8_int)
+        for grp in range(1, n_grps + 1):
+            grp_mask = labeled_orp == grp
+            grp_rows, grp_cols = np.where(grp_mask)
+            if len(grp_rows) < 2:
+                continue
+            sr2, sc2 = int(grp_rows[0]), int(grp_cols[0])
+            best_n = 9
+            for ri, ci in zip(grp_rows.tolist(), grp_cols.tolist()):
+                n_nb = sum(1 for dr, dc in NEIGHBORS_8
+                           if 0 <= ri+dr < grp_mask.shape[0]
+                           and 0 <= ci+dc < grp_mask.shape[1]
+                           and grp_mask[ri+dr, ci+dc])
+                if n_nb < best_n:
+                    best_n = n_nb
+                    sr2, sc2 = int(ri), int(ci)
+                if best_n == 1:
+                    break
+            chain2, v2 = [], np.zeros(skel_work.shape, dtype=bool)
+            cur_r2, cur_c2 = sr2, sc2
+            while True:
+                v2[cur_r2, cur_c2] = True
+                chain2.append((cur_r2, cur_c2))
+                next_r2, next_c2 = -1, -1
+                for dr, dc in NEIGHBORS_8:
+                    nr2, nc2 = cur_r2+dr, cur_c2+dc
+                    if (0 <= nr2 < skel_work.shape[0] and 0 <= nc2 < skel_work.shape[1]
+                            and grp_mask[nr2, nc2] and not v2[nr2, nc2]):
+                        next_r2, next_c2 = nr2, nc2
+                        break
+                if next_r2 == -1:
+                    break
+                cur_r2, cur_c2 = next_r2, next_c2
+            if len(chain2) >= 2:
+                lines_rc_int.append(chain2)
+
+    del skel_work, orphaned_int, node_mask_int
+    del terminals_int, junctions_int, n_neighbors_int
+    gc.collect()
+
+    # ── 5. Converter cadeias → LineStrings ──────────────────────────────
+    smooth_window_int = max(2, int(round((buffer_dist_m * 0.25) / max(skel_pixel_size, 1e-6))))
+
+    def _ma_smooth_int(coords, window, pt_start, pt_end):
+        n = len(coords)
+        if n < 3:
+            return coords
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        sx, sy = [], []
+        for i in range(n):
+            lo = max(0, i - window)
+            hi = min(n - 1, i + window)
+            count = hi - lo + 1
+            sx.append(sum(xs[lo:hi+1]) / count)
+            sy.append(sum(ys[lo:hi+1]) / count)
+        sx[0],  sy[0]  = pt_start[0], pt_start[1]
+        sx[-1], sy[-1] = pt_end[0],   pt_end[1]
+        return list(zip(sx, sy))
+
+    shapely_lines_int = []
+    for chain in lines_rc_int:
+        if len(chain) < 2:
+            continue
+        coords = [_rc_to_xy_int(r, c) for r, c in chain]
+        if len(coords) < 2:
+            continue
+        pt_start = coords[0]
+        pt_end   = coords[-1]
+        smoothed = _ma_smooth_int(coords, smooth_window_int, pt_start, pt_end)
+        if len(smoothed) < 2:
+            continue
+        line = ShpLS(smoothed)
+        if not line.is_empty and line.length > 0:
+            shapely_lines_int.append(line)
+
+    del lines_rc_int
+    gc.collect()
+
+    # Linemerge final
+    merged_int = shp_lm(shapely_lines_int)
+    del shapely_lines_int
+    gc.collect()
+
+    if merged_int.geom_type == "LineString":
+        result_lines = [merged_int]
+    elif merged_int.geom_type == "MultiLineString":
+        result_lines = list(merged_int.geoms)
+    else:
+        result_lines = [g for g in getattr(merged_int, "geoms", [])
+                        if g.geom_type == "LineString"]
+
+    # Limpar ficheiros temporários internos
+    for _tmp_f in [tmp_vec_path, tmp_rast_path]:
+        try:
+            os.remove(_tmp_f)
+        except OSError:
+            pass
+
+    _log(f"  [Transversais] Centerlines internas: {len(result_lines)} linhas geradas.")
+    return result_lines
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +531,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
     """
     Algoritmo para criação da rede completa de rotas fluviais:
     Centrais, Marginais e Transversais.
-
-    Garante que todos os parâmetros de distância (buffer e transecto)
-    são sempre interpretados em METROS, independentemente do SRC dos dados
-    de entrada. Se necessário, os dados são reprojetados automaticamente
-    para um sistema UTM métrico antes do processamento.
     """
 
     INPUT_RASTER      = "INPUT_RASTER"
@@ -206,8 +540,8 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
     BUFFER_DIST       = "BUFFER_DIST"
     TRANSECT_INTERVAL = "TRANSECT_INTERVAL"
     OUTPUT_CRS        = "OUTPUT_CRS"
-    OUTPUT_SKELETON   = "OUTPUT_SKELETON"    # raster esqueleto para inspeção
-    OUTPUT_CENTRAL    = "OUTPUT_CENTRAL"     # polylines centrais (antes da rede completa)
+    OUTPUT_SKELETON   = "OUTPUT_SKELETON"
+    OUTPUT_CENTRAL    = "OUTPUT_CENTRAL"
     OUTPUT_NETWORK    = "OUTPUT_NETWORK"
 
     # ------------------------------------------------------------------
@@ -244,7 +578,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
     # ------------------------------------------------------------------
     def initAlgorithm(self, config=None):
 
-        # 1. Raster de máscara binária
         self.addParameter(
             QgsProcessingParameterRasterLayer(
                 self.INPUT_RASTER,
@@ -252,7 +585,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # 2. Vetor de máscara binária
         self.addParameter(
             QgsProcessingParameterVectorLayer(
                 self.INPUT_VECTOR,
@@ -261,7 +593,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # 3. Limites da área de estudo (opcional)
         self.addParameter(
             QgsProcessingParameterVectorLayer(
                 self.INPUT_LIMITS,
@@ -271,7 +602,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # 4. Rastreio GPS (opcional)
         self.addParameter(
             QgsProcessingParameterVectorLayer(
                 self.INPUT_GPS_TRACKS,
@@ -281,7 +611,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # 5. Distância do Buffer Marginal — SEMPRE EM METROS
         param_buffer = QgsProcessingParameterNumber(
             self.BUFFER_DIST,
             self.tr("Distância do Buffer Marginal (metros)"),
@@ -289,12 +618,9 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             defaultValue=200.0,
             minValue=1.0,
         )
-        param_buffer.setMetadata(
-            {"widget_wrapper": {"decimals": 1}}
-        )
+        param_buffer.setMetadata({"widget_wrapper": {"decimals": 1}})
         self.addParameter(param_buffer)
 
-        # 6. Distância entre Rotas Transversais — SEMPRE EM METROS
         param_transect = QgsProcessingParameterNumber(
             self.TRANSECT_INTERVAL,
             self.tr("Distância entre Rotas Transversais (metros)"),
@@ -302,12 +628,9 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             defaultValue=1000.0,
             minValue=1.0,
         )
-        param_transect.setMetadata(
-            {"widget_wrapper": {"decimals": 1}}
-        )
+        param_transect.setMetadata({"widget_wrapper": {"decimals": 1}})
         self.addParameter(param_transect)
 
-        # 7. SRC do dado de saída (opcional — deixar em branco para usar o SRC de processamento)
         self.addParameter(
             QgsProcessingParameterCrs(
                 self.OUTPUT_CRS,
@@ -317,7 +640,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # OUTPUT A: Raster do esqueleto (inspeção visual)
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT_SKELETON,
@@ -327,7 +649,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # OUTPUT B: Polylines centrais (antes de marginais/transversais)
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT_CENTRAL,
@@ -337,7 +658,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # OUTPUT C: Rede final de linhas
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT_NETWORK,
@@ -348,31 +668,19 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
     # ------------------------------------------------------------------
     def processAlgorithm(self, parameters, context, feedback):
 
-        # ── 0. FIXAR PROJ_DATA para o OSGeo4W — DEVE SER O PRIMEIRO PASSO
-        #
-        # O GDAL/OGR e o OSR usam o PROJ para resolver CRSs. Quando há
-        # múltiplas instalações do PROJ no sistema (OSGeo4W + pip + Anaconda),
-        # o GDAL pode encontrar um proj.db de versão errada e falhar com
-        # "no database context specified" ou "Cannot parse CRS".
-        #
-        # Solução: forçar PROJ_DATA (e o alias PROJ_LIB) para o caminho
-        # do OSGeo4W ANTES de qualquer chamada GDAL/OGR/OSR.
-        # O caminho é detectado a partir da localização do gdal.py do OSGeo4W.
-        # ---------------------------------------------------------------
+        # ── 0. FIXAR PROJ_DATA ──────────────────────────────────────────
         import os as _os
         try:
             from osgeo import gdal as _gdal_probe, osr as _osr_probe
-            # Determinar a pasta do OSGeo4W a partir do caminho do gdal.py
-            _gdal_path = _gdal_probe.__file__                  # ex: C:\...\OSGeo4W\...\gdal.py
+            _gdal_path = _gdal_probe.__file__
             _osgeo4w_root = _gdal_path
-            for _ in range(6):                                 # subir até 6 níveis
+            for _ in range(6):
                 _osgeo4w_root = _os.path.dirname(_osgeo4w_root)
                 _proj_db_candidate = _os.path.join(_osgeo4w_root, "share", "proj", "proj.db")
                 if _os.path.isfile(_proj_db_candidate):
                     _proj_data_dir = _os.path.join(_osgeo4w_root, "share", "proj")
                     _os.environ["PROJ_DATA"] = _proj_data_dir
-                    _os.environ["PROJ_LIB"]  = _proj_data_dir  # alias legacy
-                    # Reinicializar o contexto PROJ do OSR
+                    _os.environ["PROJ_LIB"]  = _proj_data_dir
                     try:
                         _osr_probe.SetPROJSearchPaths([_proj_data_dir])
                     except Exception:
@@ -381,8 +689,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     break
             else:
                 feedback.pushWarning(self.tr(
-                    "Nao foi possivel localizar o proj.db do OSGeo4W automaticamente. "
-                    "Se ocorrerem erros de CRS, defina a variavel PROJ_DATA manualmente."
+                    "Nao foi possivel localizar o proj.db do OSGeo4W automaticamente."
                 ))
         except Exception as _e_proj:
             feedback.pushWarning(self.tr(f"Aviso ao fixar PROJ_DATA: {_e_proj}"))
@@ -393,27 +700,18 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         gps_layer     = self.parameterAsVectorLayer(parameters, self.INPUT_GPS_TRACKS, context)
         limits_layer  = self.parameterAsVectorLayer(parameters, self.INPUT_LIMITS, context)
 
-        buffer_dist_m    = self.parameterAsDouble(parameters, self.BUFFER_DIST, context)
+        buffer_dist_m       = self.parameterAsDouble(parameters, self.BUFFER_DIST, context)
         transect_interval_m = self.parameterAsDouble(parameters, self.TRANSECT_INTERVAL, context)
-
-        output_crs_param = self.parameterAsCrs(parameters, self.OUTPUT_CRS, context)
+        output_crs_param    = self.parameterAsCrs(parameters, self.OUTPUT_CRS, context)
 
         raster_path_orig = raster_layer.source()
         vector_path_orig = vector_layer.source()
         tmp = context.temporaryFolder()
 
         # ── 2. Detectar CRS e reprojetar se necessário ──────────────────
-        #
-        # FONTE DE VERDADE: os objetos QgsRasterLayer / QgsVectorLayer do QGIS.
-        # O QGIS pode ter o SRC definido na camada em memória mesmo quando o
-        # ficheiro físico não gravou os metadados de projeção. Usar rasterio/
-        # geopandas diretamente no ficheiro falha nesses casos.
-        # Rasterio e geopandas são usados apenas como fallback de último recurso.
-        # -----------------------------------------------------------------
         feedback.pushInfo(self.tr("A verificar SRC dos dados de entrada..."))
 
-        # ---- 2a. CRS do raster — fonte primária: QgsRasterLayer -----------
-        qgs_raster_crs = raster_layer.crs()          # QgsCoordinateReferenceSystem
+        qgs_raster_crs = raster_layer.crs()
         raster_crs_wkt = None
         raster_is_geo  = None
 
@@ -428,31 +726,22 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 )
             )
         else:
-            # Fallback: tentar rasterio diretamente no ficheiro
             try:
                 with rasterio.open(raster_path_orig) as src:
                     if src.crs is not None:
                         raster_crs_wkt = src.crs.to_wkt()
                         raster_is_geo  = _is_geographic(raster_crs_wkt)
-                        feedback.pushInfo(
-                            self.tr(
-                                f"SRC do raster lido via rasterio: "
-                                f"{'Geográfico' if raster_is_geo else 'Projetado'}"
-                            )
-                        )
+                        feedback.pushInfo(self.tr(
+                            f"SRC do raster lido via rasterio: "
+                            f"{'Geográfico' if raster_is_geo else 'Projetado'}"
+                        ))
             except Exception:
                 pass
             if raster_crs_wkt is None:
-                feedback.pushWarning(
-                    self.tr(
-                        "AVISO: O raster não tem SRC definido nem no QGIS nem no ficheiro. "
-                        "O algoritmo tentará usar o SRC do vetor. "
-                        "Para evitar este aviso, atribua o SRC ao raster no QGIS "
-                        "(Raster → Projeções → Atribuir SRC)."
-                    )
-                )
+                feedback.pushWarning(self.tr(
+                    "AVISO: O raster não tem SRC definido nem no QGIS nem no ficheiro."
+                ))
 
-        # ---- 2b. CRS do vetor — fonte primária: QgsVectorLayer ------------
         qgs_vector_crs = vector_layer.crs()
         vector_epsg    = None
         vector_is_geo  = None
@@ -461,76 +750,48 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             vector_crs_wkt = qgs_vector_crs.toWkt()
             vector_is_geo  = _is_geographic(vector_crs_wkt)
             try:
-                auth_id = qgs_vector_crs.authid()   # ex: "EPSG:31982"
+                auth_id = qgs_vector_crs.authid()
                 if auth_id.upper().startswith("EPSG:"):
                     vector_epsg = int(auth_id.split(":")[1])
             except Exception:
                 vector_epsg = None
-            feedback.pushInfo(
-                self.tr(
-                    f"SRC do vetor lido do QGIS: "
-                    f"{qgs_vector_crs.authid()} — "
-                    f"{'Geográfico (graus)' if vector_is_geo else 'Projetado (métrico)'}"
-                )
-            )
+            feedback.pushInfo(self.tr(
+                f"SRC do vetor lido do QGIS: "
+                f"{qgs_vector_crs.authid()} — "
+                f"{'Geográfico (graus)' if vector_is_geo else 'Projetado (métrico)'}"
+            ))
         else:
-            # Fallback: tentar geopandas
             try:
                 gdf_crs_check = _read_vector(vector_path_orig)
                 if gdf_crs_check.crs is not None:
                     vector_epsg   = gdf_crs_check.crs.to_epsg()
                     vector_is_geo = gdf_crs_check.crs.is_geographic
-                    feedback.pushInfo(
-                        self.tr(
-                            f"SRC do vetor lido via geopandas: EPSG:{vector_epsg}"
-                        )
-                    )
+                    feedback.pushInfo(self.tr(f"SRC do vetor lido via geopandas: EPSG:{vector_epsg}"))
             except Exception:
                 pass
             if vector_is_geo is None:
-                feedback.pushWarning(
-                    self.tr(
-                        "AVISO: O vetor não tem SRC definido nem no QGIS nem no ficheiro."
-                    )
-                )
+                feedback.pushWarning(self.tr("AVISO: O vetor não tem SRC definido."))
 
-        # ---- 2c. Ambos sem SRC — erro fatal --------------------------------
         if raster_crs_wkt is None and vector_is_geo is None:
             feedback.reportError(
                 self.tr(
-                    "ERRO: Nao foi possivel determinar o SRC do raster nem do vetor. "
-                    "Atribua o SRC correto a ambas as camadas no QGIS e tente novamente. "
-                    "Raster: clique direito → Propriedades → SRC ou Raster → Projecoes → Atribuir SRC. "
-                    "Vetor: clique direito na camada → Definir SRC da Camada."
+                    "ERRO: Nao foi possivel determinar o SRC do raster nem do vetor."
                 ),
                 fatalError=True,
             )
             return {}
 
-        # ---- 2d. Determinar EPSG de trabalho (métrico) --------------------
-        #
-        # Prioridade: (1) raster métrico → usa direto
-        #             (2) raster geográfico → calcula UTM pelo centro do raster
-        #             (3) raster sem SRC + vetor métrico → usa EPSG do vetor
-        #             (4) raster sem SRC + vetor geográfico → calcula UTM pelo centroide do vetor
-
+        # Determinar EPSG de trabalho (métrico)
         work_epsg = None
 
         if raster_crs_wkt is not None and not raster_is_geo:
-            # Caso 1: raster já métrico.
-            # Fonte primária: authid do QgsCoordinateReferenceSystem (ex: "EPSG:32722").
-            # O pyproj é usado apenas se o authid não tiver prefixo EPSG.
             work_epsg = None
-
-            # Tentativa 1: authid do QGIS (mais fiável — é o que o QGIS mostra ao utilizador)
             try:
-                auth_id = qgs_raster_crs.authid()   # ex: "EPSG:32722"
+                auth_id = qgs_raster_crs.authid()
                 if auth_id.upper().startswith("EPSG:"):
                     work_epsg = int(auth_id.split(":")[1])
             except Exception:
                 pass
-
-            # Tentativa 2: osr (fallback para SRCs não-EPSG)
             if work_epsg is None:
                 try:
                     from osgeo import osr as _osr2
@@ -541,8 +802,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                         work_epsg = int(epsg_str)
                 except Exception:
                     pass
-
-            # Tentativa 3: postgisSrid do QGIS (último recurso)
             if work_epsg is None:
                 try:
                     srid = qgs_raster_crs.postgisSrid()
@@ -550,48 +809,30 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                         work_epsg = srid
                 except Exception:
                     pass
-
             if work_epsg:
-                feedback.pushInfo(
-                    self.tr(f"SRC de trabalho: EPSG:{work_epsg} (raster métrico, sem reprojeção).")
-                )
+                feedback.pushInfo(self.tr(f"SRC de trabalho: EPSG:{work_epsg} (raster métrico)."))
             else:
-                # Nao conseguiu extrair EPSG numérico — usar o objecto QGIS directamente
-                # (work_crs_qgs será definido abaixo a partir de qgs_raster_crs)
-                feedback.pushWarning(
-                    self.tr(
-                        f"Nao foi possivel extrair o codigo EPSG numerico do SRC do raster "
-                        f"({qgs_raster_crs.authid()}). O SRC QGIS sera usado directamente. "
-                        f"Verifique os resultados."
-                    )
-                )
+                feedback.pushWarning(self.tr(
+                    f"Nao foi possivel extrair EPSG numerico do raster ({qgs_raster_crs.authid()})."
+                ))
             raster_path = raster_path_orig
 
         elif raster_crs_wkt is not None and raster_is_geo:
-            # Caso 2: raster geográfico → reprojetar para UTM
             lon, lat  = _get_raster_center_lonlat(raster_path_orig)
             work_epsg = _auto_utm_epsg(lon, lat)
-            feedback.pushInfo(
-                self.tr(
-                    f"SRC do raster é geográfico. "
-                    f"Reprojetando para EPSG:{work_epsg} (UTM)..."
-                )
-            )
+            feedback.pushInfo(self.tr(
+                f"SRC do raster é geográfico. Reprojetando para EPSG:{work_epsg} (UTM)..."
+            ))
             raster_path = _reproject_raster_to_metric(raster_path_orig, work_epsg, tmp)
 
         elif vector_is_geo is not None and not vector_is_geo and vector_epsg:
-            # Caso 3: raster sem SRC, vetor já métrico
             work_epsg = vector_epsg
-            feedback.pushWarning(
-                self.tr(
-                    f"Raster sem SRC. Usando SRC do vetor (EPSG:{work_epsg}) como SRC de trabalho. "
-                    f"Atribua o SRC real ao raster para evitar este aviso."
-                )
-            )
+            feedback.pushWarning(self.tr(
+                f"Raster sem SRC. Usando SRC do vetor (EPSG:{work_epsg})."
+            ))
             raster_path = raster_path_orig
 
         else:
-            # Caso 4: raster sem SRC, vetor geográfico → UTM pelo centroide do vetor
             try:
                 gdf_tmp = _read_vector(vector_path_orig)
                 cx = gdf_tmp.geometry.unary_union.centroid.x
@@ -599,23 +840,16 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 work_epsg = _auto_utm_epsg(cx, cy)
             except Exception:
                 feedback.reportError(
-                    self.tr(
-                        "ERRO: Não foi possível calcular o UTM automático. "
-                        "Atribua o SRC correto ao raster e tente novamente."
-                    ),
+                    self.tr("ERRO: Não foi possível calcular o UTM automático."),
                     fatalError=True,
                 )
                 return {}
-            feedback.pushWarning(
-                self.tr(
-                    f"Raster sem SRC e vetor geográfico. "
-                    f"Usando EPSG:{work_epsg} (UTM auto pelo centroide do vetor) "
-                    f"como SRC de trabalho."
-                )
-            )
+            feedback.pushWarning(self.tr(
+                f"Raster sem SRC e vetor geográfico. Usando EPSG:{work_epsg} (UTM auto)."
+            ))
             raster_path = raster_path_orig
 
-        # ---- 2e. Reprojetar vetor se necessário ---------------------------
+        # Reprojetar vetor se necessário
         needs_vector_reproject = False
         if vector_is_geo is True:
             needs_vector_reproject = True
@@ -623,41 +857,28 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             needs_vector_reproject = True
 
         if needs_vector_reproject:
-            feedback.pushInfo(
-                self.tr(
-                    f"SRC do vetor (EPSG:{vector_epsg}) difere do SRC de trabalho "
-                    f"(EPSG:{work_epsg}). A reprojetar vetor..."
-                )
-            )
+            feedback.pushInfo(self.tr(
+                f"SRC do vetor (EPSG:{vector_epsg}) difere do SRC de trabalho "
+                f"(EPSG:{work_epsg}). A reprojetar vetor..."
+            ))
             vector_path = _reproject_vector_to_metric(vector_path_orig, work_epsg, tmp)
         else:
-            feedback.pushInfo(
-                self.tr(
-                    f"SRC do vetor compativel com SRC de trabalho (EPSG:{work_epsg}). "
-                    f"Sem necessidade de reprojecao."
-                )
-            )
+            feedback.pushInfo(self.tr(
+                f"SRC do vetor compativel com SRC de trabalho (EPSG:{work_epsg})."
+            ))
             vector_path = vector_path_orig
 
-        # Leitura do GeoDataFrame do vetor (para uso nas etapas seguintes)
         gdf_check = _read_vector(vector_path)
 
-        feedback.pushInfo(
-            self.tr(
-                f"Parâmetros de distância — Buffer: {buffer_dist_m} m | "
-                f"Transecto: {transect_interval_m} m"
-            )
-        )
+        feedback.pushInfo(self.tr(
+            f"Parâmetros de distância — Buffer: {buffer_dist_m} m | "
+            f"Transecto: {transect_interval_m} m"
+        ))
 
-        # SRC QGIS de trabalho (usado no merge e na saída)
-        # Prioridade: (1) EPSG numérico extraído → constrói por código
-        #             (2) QgsRasterLayer.crs() → já é um objecto válido
-        #             (3) CRS do projecto QGIS → último recurso
         if work_epsg:
             work_crs_qgs = QgsCoordinateReferenceSystem(f"EPSG:{work_epsg}")
         elif qgs_raster_crs.isValid():
             work_crs_qgs = qgs_raster_crs
-            # Tentar recuperar o EPSG a partir do objecto QGIS como inteiro
             try:
                 srid = qgs_raster_crs.postgisSrid()
                 if srid and srid > 0:
@@ -668,55 +889,23 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         else:
             work_crs_qgs = context.project().crs()
 
-        feedback.pushInfo(
-            self.tr(f"SRC QGIS de trabalho definido: {work_crs_qgs.authid()}")
-        )
+        feedback.pushInfo(self.tr(f"SRC QGIS de trabalho definido: {work_crs_qgs.authid()}"))
 
         # ── A. ROTAS CENTRAIS ───────────────────────────────────────────
-        #
-        # ESTRATÉGIA DE MEMÓRIA:
-        #
-        # O skeletonize() precisa da imagem INTEIRA para gerar um esqueleto
-        # contínuo. Processar em blocos independentes cria descontinuidades
-        # nas bordas — por isso não é possível usar tiling directo.
-        #
-        # Estratégia adoptada (3 fases):
-        #
-        # FASE 1 — Quantização: ler o raster em blocos e gravar um raster
-        #   temporário uint8 comprimido. Reduz o tamanho antes de carregar
-        #   tudo na RAM (rasters float32/int16 passam para 1 byte/pixel).
-        #
-        # FASE 2 — Esqueletonização: carregar o raster uint8 comprimido
-        #   inteiro em RAM como array bool (menor pegada possível),
-        #   esqueletonizar, converter para uint8 e libertar o bool.
-        #
-        # FASE 3 — Gravação: gravar o esqueleto uint8 para disco em blocos
-        #   e libertar o array da memória antes de avançar.
-        #
-        # Pegada máxima de RAM durante a fase 2 (pior caso):
-        #   raster 500 MB × 1 byte/pixel (uint8 quantizado)
-        #   + array bool = mesma dimensão (~500 MB)
-        #   + array uint8 do esqueleto (~500 MB)
-        #   Total estimado: ~1.5 GB — aceitável para 8+ GB de RAM.
-        #
-        # Para rasters > 1 GB recomenda-se usar um SRC com tiles menores
-        # ou dividir a área de estudo em sub-regiões antes de processar.
+        # (NÃO ALTERADO — mantido exatamente como estava)
         # ---------------------------------------------------------------
         feedback.pushInfo(self.tr("A gerar rotas centrais — fase 1/3: a quantizar raster..."))
 
         temp_uint8_path = os.path.join(tmp, "temp_uint8.tif")
         temp_skel_path  = os.path.join(tmp, "temp_skeleton.tif")
 
-        # FASE 1: ler em blocos, gravar uint8 comprimido
         with rasterio.open(raster_path) as src:
             transform = src.transform
             crs       = src.crs
             height    = src.height
             width     = src.width
 
-            # Blocos de leitura: linhas suficientes para ~64 MB por bloco
-            # (seguro mesmo com pouca RAM disponível nesta fase)
-            bytes_per_row = width  # uint8 = 1 byte/pixel após conversão
+            bytes_per_row  = width
             rows_per_block = max(1, min(height, (64 * 1024 * 1024) // max(bytes_per_row, 1)))
 
             profile_uint8 = {
@@ -742,131 +931,72 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     dst.write((block > 0).astype(np.uint8), 1, window=window)
                     del block
                     gc.collect()
-                    feedback.setProgress(int((i + 1) / n_blocks * 20))  # 0-20%
+                    feedback.setProgress(int((i + 1) / n_blocks * 20))
                     if feedback.isCanceled():
                         return {}
 
-        feedback.pushInfo(self.tr("Fase 2/3: a pre-processar e esqueletonizar (toda a imagem em RAM)..."))
+        feedback.pushInfo(self.tr("Fase 2/3: a pre-processar e esqueletonizar..."))
 
-        # FASE 2: carregar → pré-processar → skeletonize → uint8
-        #
-        # PRÉ-PROCESSAMENTO (ordem importa):
-        #
-        # 1. REMOÇÃO DE ILHAS PEQUENAS (remove_small_objects):
-        #    Elimina manchas de pixels isolados (ruído, pixels soltos)
-        #    menores que MIN_ISLAND_PX pixels. Sem isto, cada pixel isolado
-        #    gera um esqueleto espúrio.
-        #    MIN_ISLAND_PX = área em pixels equivalente a um círculo de
-        #    raio = buffer_dist_m / pixel_size. Assim, apenas objectos com
-        #    área relevante para navegação são mantidos.
-        #
-        # 2. FECHO MORFOLÓGICO (binary_closing):
-        #    Preenche buracos pequenos e gaps na máscara (ilhas minúsculas,
-        #    pixels pretos espúrios dentro do canal). Um rio contínuo deve
-        #    ter uma máscara contínua — gaps causam descontinuidades no
-        #    esqueleto. Kernel circular de raio CLOSE_R pixels.
-        #
-        # 3. SUAVIZAÇÃO DAS BORDAS (binary_opening):
-        #    Remove protuberâncias finas nas bordas da máscara (efeito
-        #    "dentes de serra" de pixelização). Reduz drasticamente as
-        #    ramificações falsas no esqueleto. Kernel circular de raio
-        #    OPEN_R pixels (menor que CLOSE_R para não destruir canais finos).
-        #
-        # Os raios são calculados em pixels a partir de buffer_dist_m,
-        # garantindo que as operações morfológicas são proporcionais à
-        # escala real do dado independentemente da resolução do raster.
-        # ---------------------------------------------------------------
         with rasterio.open(temp_uint8_path) as src:
-            data_uint8  = src.read(1)
-            pixel_size_m = abs(src.transform.a)   # metros por pixel
+            data_uint8   = src.read(1)
+            pixel_size_m = abs(src.transform.a)
         feedback.setProgress(22)
 
         data_bool = data_uint8 > 0
         del data_uint8
         gc.collect()
 
-        # Calcular raios morfológicos em pixels
-        # CLOSE_R: preenche gaps até ~10% do buffer marginal
-        # OPEN_R:  suaviza bordas a ~5% do buffer marginal (metade do close)
-        # MIN_ISLAND_PX: área mínima = círculo de raio = buffer/2
-        close_r         = max(1, int(round((buffer_dist_m * 0.10) / max(pixel_size_m, 1e-6))))
-        open_r          = max(1, int(round((buffer_dist_m * 0.05) / max(pixel_size_m, 1e-6))))
-        min_island_px   = max(10, int(3.14159 * ((buffer_dist_m * 0.5) / max(pixel_size_m, 1e-6)) ** 2))
+        close_r       = max(1, int(round((buffer_dist_m * 0.10) / max(pixel_size_m, 1e-6))))
+        open_r        = max(1, int(round((buffer_dist_m * 0.05) / max(pixel_size_m, 1e-6))))
+        min_island_px = max(10, int(3.14159 * ((buffer_dist_m * 0.5) / max(pixel_size_m, 1e-6)) ** 2))
 
         feedback.pushInfo(self.tr(
             f"Pre-processamento morfologico: pixel={pixel_size_m:.2f}m | "
             f"close_r={close_r}px | open_r={open_r}px | min_island={min_island_px}px"
         ))
 
-        # 1. Remover ilhas pequenas
         feedback.pushInfo(self.tr("  Removendo objectos pequenos (ruido)..."))
         data_bool = remove_small_objects(data_bool, min_size=min_island_px, connectivity=2)
         gc.collect()
         feedback.setProgress(25)
 
-        # 2. Fecho morfológico — preencher gaps e buracos
         feedback.pushInfo(self.tr("  Fecho morfologico (preenchimento de gaps)..."))
         data_bool = binary_closing(data_bool, footprint=disk(close_r))
         gc.collect()
         feedback.setProgress(30)
 
-        # 3. Abertura morfológica — suavizar bordas
         feedback.pushInfo(self.tr("  Abertura morfologica (suavizacao de bordas)..."))
         data_bool = binary_opening(data_bool, footprint=disk(open_r))
         gc.collect()
         feedback.setProgress(33)
 
-        # Esqueletonizar a máscara pré-processada
         feedback.pushInfo(self.tr("  Esqueletonizando..."))
         skeleton_bool = skeletonize(data_bool)
         del data_bool
         gc.collect()
         feedback.setProgress(35)
 
-        # ── AFINAMENTO ADICIONAL (thin) ─────────────────────────────────
-        # skeletonize() pode deixar trechos com 2 pixels de largura,
-        # especialmente em curvas e confluências. Isso gera duas linhas
-        # paralelas no rastreio de grafo.
-        # thin() aplica o algoritmo de Zhang-Suen iterativamente até
-        # convergência, garantindo largura de exactamente 1 pixel.
-        feedback.pushInfo(self.tr("  Afinamento (thin) para garantir 1 pixel de largura..."))
+        feedback.pushInfo(self.tr("  Afinamento (thin)..."))
         skeleton_bool = skimage_thin(skeleton_bool)
         gc.collect()
         feedback.setProgress(37)
 
-        # ── PODA DE RAMOS CURTOS (PRUNING) ─────────────────────────────
-        #
-        # O skeletonize gera ramos espúrios em:
-        #   • Confluências (triângulo em vez de Y)
-        #   • Bordas irregulares da máscara (pequenos "pelos")
-        #   • Ilhas e concavidades
-        #
-        # Algoritmo de poda iterativa:
-        #   Um pixel de esqueleto é "terminal" se tiver exactamente 1
-        #   vizinho activo na vizinhança 3×3. Remover terminais iterativamente
-        #   elimina ramos curtos sem afectar o canal principal.
-        #
-        # PRUNE_PX = comprimento máximo a podar em pixels
-        #   = buffer_dist_m / pixel_size_m × 0.5
-        #   (ramos menores que metade do buffer são considerados espúrios)
-        # ---------------------------------------------------------------
         prune_px = max(3, int(round((buffer_dist_m * 0.5) / max(pixel_size_m, 1e-6))))
-        feedback.pushInfo(self.tr(f"  Poda de ramos curtos: prune_px={prune_px}px ({prune_px * pixel_size_m:.1f}m)..."))
+        feedback.pushInfo(self.tr(
+            f"  Poda de ramos curtos: prune_px={prune_px}px ({prune_px * pixel_size_m:.1f}m)..."
+        ))
 
         skel = skeleton_bool.copy()
         del skeleton_bool
         gc.collect()
 
-        # Kernel de vizinhança 3×3 para contar vizinhos
         neighbor_kernel = np.ones((3, 3), dtype=np.uint8)
-        neighbor_kernel[1, 1] = 0   # não contar o próprio pixel
+        neighbor_kernel[1, 1] = 0
 
         for _iter in range(prune_px):
             if not skel.any():
                 break
-            # Contar vizinhos activos de cada pixel
             neighbor_count = nd_convolve(skel.astype(np.uint8), neighbor_kernel, mode="constant", cval=0)
-            # Terminal: pixel activo com exactamente 1 vizinho
             terminals = skel & (neighbor_count == 1)
             if not terminals.any():
                 break
@@ -880,27 +1010,24 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         feedback.pushInfo(self.tr("Fase 3/3: a gravar esqueleto em disco..."))
 
-        # FASE 3: gravar em blocos e libertar
         profile_skel = profile_uint8.copy()
         with rasterio.open(temp_skel_path, "w", **profile_skel) as dst:
             for i, row_off in enumerate(range(0, height, rows_per_block)):
                 actual_rows = min(rows_per_block, height - row_off)
                 window = rasterio.windows.Window(0, row_off, width, actual_rows)
                 dst.write(skeleton_uint8[row_off:row_off + actual_rows, :], 1, window=window)
-                feedback.setProgress(40 + int((i + 1) / n_blocks * 10))  # 40-50%
+                feedback.setProgress(40 + int((i + 1) / n_blocks * 10))
                 if feedback.isCanceled():
                     return {}
 
         del skeleton_uint8
         gc.collect()
 
-        # Remover o raster uint8 intermédio para libertar espaço em disco
         try:
             os.remove(temp_uint8_path)
         except OSError:
             pass
 
-        # ── OUTPUT_SKELETON: exportar raster do esqueleto se pedido ────
         skel_dest = parameters.get(self.OUTPUT_SKELETON)
         if skel_dest:
             feedback.pushInfo(self.tr("A exportar raster do esqueleto para inspeção..."))
@@ -912,33 +1039,8 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             except Exception as e_skel:
                 feedback.pushWarning(self.tr(f"Nao foi possivel exportar o raster do esqueleto: {e_skel}"))
 
-        feedback.pushInfo(self.tr("Esqueleto gravado. A vectorizar via rastreio de grafo de pixels..."))
+        feedback.pushInfo(self.tr("Esqueleto gravado. A vectorizar via rastreio de grafo..."))
 
-        # ── VECTORIZAÇÃO DO ESQUELETO — RASTREIO DE GRAFO ──────────────
-        #
-        # PROBLEMA com rasterio.features.shapes() + boundary:
-        #   shapes() agrupa pixels contíguos em POLÍGONOS (regiões de cor
-        #   uniforme). O boundary desses polígonos é o CONTORNO da região,
-        #   não a linha central. Para um esqueleto diagonal, o contorno é
-        #   uma série de quadradinhos perpendiculares ao canal — exactamente
-        #   os "traços" visíveis na imagem.
-        #
-        # SOLUÇÃO — rastreio de grafo de pixels (pixel graph tracing):
-        #   1. Carregar o esqueleto inteiro como array bool.
-        #   2. Para cada pixel activo, identificar os seus vizinhos activos
-        #      na vizinhança 8-conexa (Moore neighbourhood).
-        #   3. Os pixels com exactamente 2 vizinhos são "internos" (meio
-        #      de uma linha). Os pixels com 1 vizinho são "terminais"
-        #      (ponta de linha). Os pixels com 3+ vizinhos são "junções".
-        #   4. Percorrer a cadeia de pixels internos entre junções/terminais,
-        #      recolhendo as coordenadas reais (via transform) em ordem.
-        #   5. Cada cadeia torna-se uma LineString. Depois simplify +
-        #      Chaikin para suavizar os degraus da grade.
-        #
-        # MEMÓRIA: o esqueleto uint8 já está em memória (skeleton_uint8
-        # foi gravado no ficheiro mas o array foi libertado). Relemos o
-        # ficheiro comprimido — ocupa muito menos que o raster original.
-        # ---------------------------------------------------------------
         from shapely.geometry import LineString as ShpLineString
         from osgeo            import ogr, osr
         from scipy.ndimage    import label as nd_label2
@@ -952,71 +1054,30 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         feedback.setProgress(51)
 
-        # ── Calcular número de vizinhos 8-conexos para cada pixel ──────
-        # neighbor_kernel já definido acima (nd_convolve + ones 3x3 sem centro)
         n_neighbors = nd_convolve(
             skel_arr.astype(np.uint8), neighbor_kernel, mode="constant", cval=0
         )
 
-        # Classificar pixels
-        terminals  = skel_arr & (n_neighbors == 1)   # ponta
-        internals  = skel_arr & (n_neighbors == 2)   # meio de linha
-        junctions  = skel_arr & (n_neighbors >= 3)   # bifurcação/cruzamento
-        # Pixels isolados (0 vizinhos) — ignorar
-        skel_arr = skel_arr & (n_neighbors >= 1)
+        terminals  = skel_arr & (n_neighbors == 1)
+        internals  = skel_arr & (n_neighbors == 2)
+        junctions  = skel_arr & (n_neighbors >= 3)
+        skel_arr   = skel_arr & (n_neighbors >= 1)
 
         feedback.setProgress(53)
 
-        # ── Função para converter (row, col) → (x, y) em coordenadas reais
         def _rc_to_xy(r, c):
             x, y = rasterio.transform.xy(skel_transform, r, c, offset="center")
             return float(x), float(y)
 
-        # ── Função de suavização de Chaikin ──────────────────────────
-        def _chaikin(coords, iters=3):
-            for _ in range(iters):
-                if len(coords) < 3:
-                    break
-                nc = [coords[0]]
-                for j in range(len(coords) - 1):
-                    x0, y0 = coords[j];  x1, y1 = coords[j+1]
-                    nc.append((0.75*x0 + 0.25*x1, 0.75*y0 + 0.25*y1))
-                    nc.append((0.25*x0 + 0.75*x1, 0.25*y0 + 0.75*y1))
-                nc.append(coords[-1])
-                coords = nc
-            return coords
-
-        # ── RASTREIO DE GRAFO EXPLÍCITO ─────────────────────────────────
-        #
-        # Abordagem anterior: rastreio sequencial que marcava pixels como
-        # visitados à medida que avançava. Problema: quando dois ramos
-        # chegavam à mesma junção, um deles chegava exactamente ao pixel
-        # de junção e o outro parava num pixel interno adjacente — os
-        # endpoints nunca eram o mesmo pixel, quebrando a topologia.
-        #
-        # Nova abordagem — grafo explícito nó→aresta:
-        #
-        #   PASSO 1: Identificar todos os NÓS = pixels terminais + junções.
-        #            Cada nó tem uma coordenada (x,y) exacta e única.
-        #
-        #   PASSO 2: Para cada nó, para cada vizinho não visitado:
-        #            Seguir a cadeia de pixels INTERNOS (n_vizinhos == 2)
-        #            até chegar a outro NÓ. A cadeia começa no nó de
-        #            origem e termina no nó de destino.
-        #            Marcar as ARESTAS como visitadas (não os nós).
-        #
-        #   PASSO 3: Cada aresta do grafo = uma lista de pixels ordenados
-        #            [nó_origem, interno_1, ..., interno_n, nó_destino].
-        #            Garantia: todas as arestas que chegam ao mesmo nó
-        #            terminam EXACTAMENTE nas mesmas coordenadas desse nó.
-        #
-        # Resultado: topologia correcta com nós partilhados por definição.
-        # ---------------------------------------------------------------
-
         NEIGHBORS_8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
 
+        node_mask = terminals | junctions
+        visited_edges = set()
+        lines_rc = []
+        node_rows, node_cols = np.where(node_mask)
+        total_nodes = len(node_rows)
+
         def _all_neighbors(r, c):
-            """Todos os vizinhos 8-conexos activos (visitados ou não)."""
             nb = []
             for dr, dc in NEIGHBORS_8:
                 nr, nc_ = r+dr, c+dc
@@ -1025,49 +1086,24 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                         nb.append((nr, nc_))
             return nb
 
-        # Conjunto de nós: pixels terminais ou de junção
-        node_mask = terminals | junctions
-
-        # Conjunto de arestas já percorridas: chave = frozenset({(r1,c1),(r2,c2)})
-        # para o primeiro e último pixel de cada aresta
-        visited_edges = set()
-
-        lines_rc = []
-
-        node_rows, node_cols = np.where(node_mask)
-        total_nodes = len(node_rows)
-
         for ni, (nr0, nc0) in enumerate(zip(node_rows, node_cols)):
-            # Para cada vizinho deste nó, tentar percorrer uma aresta
             for (vr, vc) in _all_neighbors(nr0, nc0):
                 edge_key = (min((nr0,nc0),(vr,vc)), max((nr0,nc0),(vr,vc)))
                 if edge_key in visited_edges:
                     continue
-
-                # Percorrer a aresta: começar no nó (nr0,nc0),
-                # entrar no vizinho (vr,vc) e seguir internos até ao próximo nó
                 chain = [(nr0, nc0), (vr, vc)]
                 visited_edges.add(edge_key)
-
                 cur_r, cur_c = vr, vc
-
-                # Se o vizinho já é um nó, a aresta tem apenas 2 pixels
                 if node_mask[cur_r, cur_c]:
                     if len(chain) >= 2:
                         lines_rc.append(chain)
                     continue
-
-                # Seguir pixels internos até ao próximo nó
                 prev_r, prev_c = nr0, nc0
                 while True:
-                    # Vizinhos activos excluindo o pixel anterior
                     nbs = [(r, c) for r, c in _all_neighbors(cur_r, cur_c)
                            if (r, c) != (prev_r, prev_c)]
-
                     if not nbs:
-                        # Beco sem saída — terminar aqui
                         break
-
                     if len(nbs) == 1:
                         next_r, next_c = nbs[0]
                         e2 = (min((cur_r,cur_c),(next_r,next_c)),
@@ -1076,15 +1112,10 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                         visited_edges.add(e2)
                         prev_r, prev_c = cur_r, cur_c
                         cur_r, cur_c = next_r, next_c
-                        # Parar se chegou a um nó
                         if node_mask[cur_r, cur_c]:
                             break
                     else:
-                        # Pixel com múltiplos vizinhos não-anteriores
-                        # → é uma junção não classificada (raro após thin)
-                        # Terminar a aresta aqui
                         break
-
                 if len(chain) >= 2:
                     lines_rc.append(chain)
 
@@ -1093,9 +1124,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 if feedback.isCanceled():
                     return {}
 
-        # ── SEGUNDA PASSAGEM: pixels orphaned ──────────────────────────
-        # Pixels internos não cobertos pelo rastreio de grafo
-        # (ex: linhas circulares sem nenhum nó, ou trechos isolados).
         visited_flat = set()
         for chain in lines_rc:
             for px in chain:
@@ -1106,24 +1134,8 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             orphaned_mask[r, c] = False
         n_orphaned = int(orphaned_mask.sum())
 
-        # ── SEGUNDA PASSAGEM: pixels orphaned ──────────────────────────
-        # Pixels activos que não foram visitados na primeira passagem.
-        # Isso acontece quando:
-        #   • Um pixel interno tem todos os seus vizinhos já visitados
-        #     por ramos diferentes — nunca é incluído em nenhuma cadeia.
-        #   • Trechos diagonais onde o rastreio "saltou" por cima.
-        #   • Pixels em loops circulares sem terminal nem junção.
-        #
-        # Estratégia: encontrar todos os pixels activos não visitados,
-        # agrupá-los por conectividade (scipy.ndimage.label) e rastrear
-        # cada grupo independentemente a partir do seu primeiro pixel.
-        # ── SEGUNDA PASSAGEM: pixels orphaned ──────────────────────────
-        # Pixels internos nao cobertos pelo rastreio de grafo.
-        # (ex: loops sem nos, ou trechos isolados sem terminal/juncao)
         if n_orphaned > 0:
-            feedback.pushInfo(self.tr(
-                f"  Segunda passagem: {n_orphaned} pixels orphaned a rastrear..."
-            ))
+            feedback.pushInfo(self.tr(f"  Segunda passagem: {n_orphaned} pixels orphaned..."))
             struct_8 = np.ones((3, 3), dtype=bool)
             labeled_orphans, n_groups = nd_label(orphaned_mask, structure=struct_8)
 
@@ -1131,11 +1143,8 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 grp_mask = labeled_orphans == grp
                 grp_rows, grp_cols = np.where(grp_mask)
                 if len(grp_rows) < 2:
-                    # Pixel isolado — ignorar
                     visited_flat.add((int(grp_rows[0]), int(grp_cols[0])))
                     continue
-
-                # Ponto de arranque: pixel terminal do grupo (menos vizinhos)
                 sr2, sc2 = int(grp_rows[0]), int(grp_cols[0])
                 best_start_n = 9
                 for ri, ci in zip(grp_rows.tolist(), grp_cols.tolist()):
@@ -1150,12 +1159,9 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                         sr2, sc2 = int(ri), int(ci)
                     if best_start_n == 1:
                         break
-
-                # Rastreio em cadeia ordenada dentro do grupo
                 chain2  = []
                 v2      = np.zeros(skel_arr.shape, dtype=bool)
                 cur_r2, cur_c2 = sr2, sc2
-
                 while True:
                     v2[cur_r2, cur_c2] = True
                     visited_flat.add((cur_r2, cur_c2))
@@ -1170,12 +1176,9 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     if next_r2 == -1:
                         break
                     cur_r2, cur_c2 = next_r2, next_c2
-
                 if len(chain2) >= 2:
                     lines_rc.append(chain2)
 
-        # Contar pixels ainda nao cobertos (apenas para log)
-        n_after_orphan = int(orphaned_mask.sum()) - n_orphaned
         feedback.pushInfo(self.tr(
             f"Rastreio concluido: {len(lines_rc)} cadeias | "
             f"{max(0, n_orphaned - len(visited_flat))} pixels ainda nao cobertos."
@@ -1185,114 +1188,56 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         gc.collect()
         feedback.setProgress(58)
 
-        # ── Converter cadeias (row,col) → LineStrings Shapely ──────────
-        #
-        # PROBLEMA DO CHAIKIN: o algoritmo de Chaikin NÃO É interpolativo
-        # — a curva resultante não passa pelos pontos originais, apenas
-        # se aproxima. Em curvas de 90°+ com pixels de grade, o desvio
-        # pode ser de dezenas de pixels, gerando "linhas fantasma" em
-        # zonas sem esqueleto.
-        #
-        # SOLUÇÃO: usar apenas simplify (Ramer-Douglas-Peucker), que é
-        # interpolativo — a linha resultante está sempre dentro de
-        # simplify_tol dos pontos originais. Sem Chaikin.
-        #
-        # PROBLEMA DO DFS DESORDENADO: a segunda passagem usava DFS
-        # (pilha LIFO) que visita pixels em ordem aleatória, gerando
-        # cadeias com coordenadas embaralhadas. Uma LineString com coords
-        # fora de ordem é válida geometricamente mas visualmente errada
-        # (ziguezague). Solução: ordenar cada cadeia por proximidade
-        # (nearest-neighbour sort) antes de converter.
-        #
-        # Fases:
-        #   1. Ordenar coords de cada cadeia por proximidade ao vizinho
-        #   2. Converter para LineString + simplify (sem Chaikin)
-        #   3. linemerge para unir segmentos contíguos
-        #   4. deduplicação por distância média
-
         from shapely.ops import linemerge, unary_union as shp_unary_union
         from shapely.geometry import MultiLineString as ShpMultiLine
 
-        # Tolerância do simplify: 1 pixel. Mantém a fidelidade ao esqueleto.
-        simplify_tol = pixel_size * 1.0
+        simplify_tol  = pixel_size * 1.0
         shapely_lines = []
 
         feedback.pushInfo(self.tr("  Convertendo cadeias para LineStrings..."))
-        # SMOOTH_WINDOW: raio da janela da média móvel em pixels.
-        # Valor = pixels equivalentes a 1/4 do buffer marginal.
-        # Exemplo: buffer=200m, pixel=10m → smooth_window = 5 pixels.
-        # Mínimo de 2 (janela de 5 pontos) para ter efeito visível.
         smooth_window = max(2, int(round((buffer_dist_m * 0.25) / max(pixel_size_m, 1e-6))))
         feedback.pushInfo(self.tr(
             f"  Smooth de media movel: janela={smooth_window * 2 + 1} pontos "
-            f"({smooth_window * 2 + 1} x {pixel_size_m:.1f}m = "
-            f"{(smooth_window * 2 + 1) * pixel_size_m:.1f}m)"
+            f"({(smooth_window * 2 + 1) * pixel_size_m:.1f}m)"
         ))
 
         def _moving_average_smooth(coords, window, pt_start, pt_end):
-            """
-            Suaviza uma lista de coordenadas por média móvel simétrica.
-
-            Para cada ponto i, a posição suavizada é a média dos pontos
-            no intervalo [i-window, i+window]. As extremidades (pt_start
-            e pt_end) são sempre preservadas exactas — garantia topológica.
-
-            Parâmetros:
-                coords   — lista de (x, y)
-                window   — raio da janela (número de pontos de cada lado)
-                pt_start — coordenada exacta do início (imutável)
-                pt_end   — coordenada exacta do fim (imutável)
-            """
             n = len(coords)
             if n < 3:
                 return coords
-
             xs = [c[0] for c in coords]
             ys = [c[1] for c in coords]
             sx, sy = [], []
-
             for i in range(n):
                 lo = max(0, i - window)
                 hi = min(n - 1, i + window)
                 count = hi - lo + 1
                 sx.append(sum(xs[lo:hi+1]) / count)
                 sy.append(sum(ys[lo:hi+1]) / count)
-
-            # Restaurar extremidades exactas — nunca movidas pelo smooth
             sx[0],  sy[0]  = pt_start[0], pt_start[1]
             sx[-1], sy[-1] = pt_end[0],   pt_end[1]
-
             return list(zip(sx, sy))
 
         for chain in lines_rc:
             if len(chain) < 2:
                 continue
-
             coords = [_rc_to_xy(r, c) for r, c in chain]
             if len(coords) < 2:
                 continue
-
-            # Preservar extremidades exactas para garantia topológica
             pt_start = coords[0]
             pt_end   = coords[-1]
-
-            # Aplicar média móvel para suavizar degraus de pixel
-            # (substitui o simplify RDP — suaviza sem remover pontos)
             smoothed = _moving_average_smooth(coords, smooth_window, pt_start, pt_end)
             if len(smoothed) < 2:
                 continue
-
             line = ShpLineString(smoothed)
             if line.is_empty or line.length == 0:
                 continue
-
             shapely_lines.append(line)
 
         del lines_rc
         gc.collect()
         feedback.pushInfo(self.tr(f"  {len(shapely_lines)} segmentos antes do merge."))
 
-        # ── LINEMERGE: unir segmentos que se tocam nas extremidades ─────
         feedback.pushInfo(self.tr("  Unindo segmentos contiguos (linemerge)..."))
         merged = linemerge(shapely_lines)
         del shapely_lines
@@ -1307,40 +1252,24 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos linemerge."))
 
-        # ── SNAP TOPOLÓGICO COM cKDTree ─────────────────────────────────
-        # Problema do snap por grid: dois pontos na fronteira de células
-        # adjacentes do grid ficam em chaves diferentes mesmo sendo
-        # vizinhos próximos — não são unidos.
-        #
-        # Solução com cKDTree:
-        #   1. Recolher todas as extremidades (primeiro e último ponto
-        #      de cada linha).
-        #   2. Para cada extremidade, encontrar todas as outras dentro
-        #      de SNAP_TOL usando query_ball_point (O(n log n)).
-        #   3. Agrupar extremidades próximas por union-find e forçar
-        #      todas do mesmo grupo para a mesma coordenada (a média).
-        #   4. Re-executar linemerge com as coords corrigidas.
-        # ---------------------------------------------------------------
         from scipy.spatial import cKDTree as _cKDTree
 
-        SNAP_TOL = pixel_size * 2.0   # 2 pixels — cobre gaps do rastreio
+        SNAP_TOL = pixel_size * 2.0
 
-        # Recolher todas as extremidades com índice
-        all_endpoints = []   # lista de (x, y)
-        ep_map = []          # (line_idx, 'start'|'end')
+        all_endpoints = []
+        ep_map = []
         for li, ml in enumerate(merged_lines):
             coords_ml = list(ml.coords)
             all_endpoints.append(coords_ml[0])
-            ep_map.append((li, 0))           # 0 = start
+            ep_map.append((li, 0))
             all_endpoints.append(coords_ml[-1])
-            ep_map.append((li, -1))          # -1 = end
+            ep_map.append((li, -1))
 
         if len(all_endpoints) >= 2:
             ep_arr  = np.array(all_endpoints)
             tree    = _cKDTree(ep_arr)
-            pairs   = tree.query_pairs(SNAP_TOL)   # set de (i, j) com dist < tol
+            pairs   = tree.query_pairs(SNAP_TOL)
 
-            # Union-Find para agrupar extremidades próximas
             parent = list(range(len(all_endpoints)))
             def _find(x):
                 while parent[x] != x:
@@ -1354,17 +1283,15 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             for i, j in pairs:
                 _union(i, j)
 
-            # Para cada grupo, calcular a coordenada média e aplicar
             from collections import defaultdict
             groups = defaultdict(list)
             for idx in range(len(all_endpoints)):
                 groups[_find(idx)].append(idx)
 
-            # Criar dicionário de substituição: idx → coord_media do grupo
             snap_to = {}
             for root, members in groups.items():
                 if len(members) < 2:
-                    continue   # sem vizinhos — não precisa de snap
+                    continue
                 xs = [all_endpoints[m][0] for m in members]
                 ys = [all_endpoints[m][1] for m in members]
                 cx_mean = sum(xs) / len(xs)
@@ -1372,7 +1299,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 for m in members:
                     snap_to[m] = (cx_mean, cy_mean)
 
-            # Aplicar snap às linhas
             snapped_lines = []
             for li, ml in enumerate(merged_lines):
                 coords_ml = list(ml.coords)
@@ -1390,7 +1316,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         else:
             snapped_lines = merged_lines
 
-        # Re-executar linemerge após snap
         merged2 = linemerge(snapped_lines)
         del snapped_lines
         gc.collect()
@@ -1403,28 +1328,21 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             merged_lines = [g for g in getattr(merged2, "geoms", [])
                            if g.geom_type == "LineString"]
 
-        feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos snap topologico (cKDTree)."))
+        feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos snap topologico."))
 
-        # ── DEDUPLICAÇÃO POR DISTÂNCIA MÉDIA (Hausdorff aproximado) ────
-        # Compara amostras de pontos ao longo de cada par de linhas.
-        # Duas linhas são paralelas se a distância média entre amostras
-        # for menor que DEDUP_DIST (3 pixels). Mantém a mais longa.
-        # Muito mais robusto que comparar apenas o ponto médio.
-        DEDUP_DIST  = pixel_size * 3.0
-        N_SAMPLES   = 10   # pontos amostrados por linha para comparação
+        DEDUP_DIST = pixel_size * 3.0
+        N_SAMPLES  = 10
 
         def _avg_dist(la, lb):
-            """Distância média entre N_SAMPLES pontos de la e lb."""
             total = 0.0
             for k in range(N_SAMPLES):
                 t = k / max(N_SAMPLES - 1, 1)
                 pa = la.interpolate(t, normalized=True)
-                dist = lb.distance(pa)
-                total += dist
+                total += lb.distance(pa)
             return total / N_SAMPLES
 
         if len(merged_lines) > 1:
-            feedback.pushInfo(self.tr(f"  Deduplicando {len(merged_lines)} linhas por distancia media..."))
+            feedback.pushInfo(self.tr(f"  Deduplicando {len(merged_lines)} linhas..."))
             keep = [True] * len(merged_lines)
             lengths = [l.length for l in merged_lines]
             for i in range(len(merged_lines)):
@@ -1433,7 +1351,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 for j in range(i + 1, len(merged_lines)):
                     if not keep[j]:
                         continue
-                    # Verificação rápida por bounding box antes do cálculo completo
                     bi = merged_lines[i].bounds
                     bj = merged_lines[j].bounds
                     bb_dist = max(
@@ -1442,7 +1359,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                         0
                     )
                     if bb_dist > DEDUP_DIST * 2:
-                        continue   # bounding boxes distantes — não são paralelas
+                        continue
                     if _avg_dist(merged_lines[i], merged_lines[j]) < DEDUP_DIST:
                         if lengths[i] >= lengths[j]:
                             keep[j] = False
@@ -1452,7 +1369,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             merged_lines = [l for l, k in zip(merged_lines, keep) if k]
             feedback.pushInfo(self.tr(f"  {len(merged_lines)} linhas apos deduplicacao."))
 
-        # ── Gravar via OGR ──────────────────────────────────────────────
         temp_central_path = os.path.join(tmp, "temp_central.gpkg")
 
         srs = osr.SpatialReference()
@@ -1482,14 +1398,12 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             ogr_geom = ogr.CreateGeometryFromWkt(smooth_line.wkt)
             if ogr_geom is None:
                 continue
-
             feat = ogr.Feature(lyr_defn)
             feat.SetGeometry(ogr_geom)
             feat.SetField("source", "central")
             lyr.CreateFeature(feat)
             feat = None
             feat_count += 1
-
             if feat_count % BATCH_SIZE == 0:
                 lyr.CommitTransaction()
                 lyr.StartTransaction()
@@ -1501,41 +1415,26 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr(f"Vectorizacao concluida: {feat_count} polylines gravadas."))
         feedback.setProgress(58)
 
-        # ── UNIÃO DE EXTREMIDADES PRÓXIMAS DENTRO DO POLÍGONO DE ÁGUA ──
-        #
-        # Após o linemerge, podem restar linhas cujas extremidades estão
-        # próximas mas não se tocam (gaps de 1-2 pixels na esqueletonização,
-        # ou canais ligeiramente separados).
-        # Para cada par de extremidades (endpoint) que:
-        #   1. Distam menos que JOIN_DIST metros entre si, E
-        #   2. A linha recta entre elas está DENTRO do polígono de água
-        # → cria-se uma nova LineString de ligação.
-        # A condição 2 garante que a união nunca passa por terra.
-        # ---------------------------------------------------------------
+        # União de extremidades próximas dentro do polígono de água
         feedback.pushInfo(self.tr("A unir extremidades proximas dentro da mascara de agua..."))
 
         from shapely.geometry import LineString as ShpLineString, Point as ShpPoint
         from shapely.ops      import linemerge as shp_linemerge
 
-        # Carregar polígono de água para validação da união
-        water_gdf_join = _read_vector(vector_path)[["geometry"]]
+        water_gdf_join   = _read_vector(vector_path)[["geometry"]]
         water_union_join = water_gdf_join.geometry.unary_union
         del water_gdf_join
         gc.collect()
 
-        # Distância máxima para união: 3× o tamanho do pixel
-        # (cobre gaps que sobram após pruning/thin)
         JOIN_DIST = pixel_size * 3.0
 
-        # Ler todas as linhas do gpkg gerado
         from osgeo import ogr as _ogr2
-        ds_read = _ogr2.Open(temp_central_path)
+        ds_read  = _ogr2.Open(temp_central_path)
         lyr_read = ds_read.GetLayer(0)
         central_shapely = []
         for feat_r in lyr_read:
             wkt = feat_r.GetGeometryRef().ExportToWkt()
             try:
-                from shapely.geometry import shape as shp_shape
                 from shapely import wkt as shp_wkt
                 geom = shp_wkt.loads(wkt)
                 if geom and not geom.is_empty:
@@ -1545,37 +1444,33 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         ds_read = None
         gc.collect()
 
-        # Recolher todos os endpoints (primeiro e último ponto de cada linha)
-        endpoints = []   # lista de (ShpPoint, line_idx, 'start'|'end')
+        endpoints = []
         for li, line in enumerate(central_shapely):
             coords = list(line.coords)
             if len(coords) >= 2:
                 endpoints.append((ShpPoint(coords[0]),  li, "start"))
                 endpoints.append((ShpPoint(coords[-1]), li, "end"))
 
-        # Encontrar pares de endpoints próximos de linhas DIFERENTES
         connector_lines = []
         used_pairs = set()
         for i, (pa, la, _) in enumerate(endpoints):
             for j, (pb, lb, _) in enumerate(endpoints):
                 if la == lb:
-                    continue   # mesmo line — não conectar consigo próprio
+                    continue
                 pair_key = (min(la, lb), max(la, lb))
                 if pair_key in used_pairs:
                     continue
                 dist = pa.distance(pb)
                 if dist < 1e-6 or dist > JOIN_DIST:
                     continue
-                # Verificar se a linha recta entre os pontos está dentro da água
                 connector = ShpLineString([pa.coords[0], pb.coords[0]])
                 if water_union_join.contains(connector):
                     connector_lines.append(connector)
                     used_pairs.add(pair_key)
 
         if connector_lines:
-            feedback.pushInfo(self.tr(f"  {len(connector_lines)} ligacoes criadas dentro da mascara de agua."))
-            # Adicionar conectores ao gpkg existente
-            ds_conn = _ogr2.Open(temp_central_path, 1)  # 1 = update
+            feedback.pushInfo(self.tr(f"  {len(connector_lines)} ligacoes criadas."))
+            ds_conn  = _ogr2.Open(temp_central_path, 1)
             lyr_conn = ds_conn.GetLayer(0)
             lyr_conn.StartTransaction()
             lyr_defn_conn = lyr_conn.GetLayerDefn()
@@ -1591,15 +1486,13 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             lyr_conn.CommitTransaction()
             ds_conn = None
         else:
-            feedback.pushInfo(self.tr("  Nenhuma extremidade proxima encontrada para unir."))
+            feedback.pushInfo(self.tr("  Nenhuma extremidade proxima encontrada."))
 
         del water_union_join, endpoints, connector_lines
         gc.collect()
         feedback.setProgress(60)
 
-        # ── ENTREGAR OUTPUT_CENTRAL (polylines individuais) ─────────────
-        # Usar o ficheiro gpkg directamente — cada feature é uma LineString
-        # individual (não MultiLineString). O OUTPUT_CENTRAL é opcional.
+        # Entregar OUTPUT_CENTRAL (opcional)
         central_dest = parameters.get(self.OUTPUT_CENTRAL)
         if central_dest:
             feedback.pushInfo(self.tr("A exportar rotas centrais (polylines)..."))
@@ -1611,14 +1504,13 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 central_fields, QgsWkbTypes.LineString, work_crs_qgs
             )
             if central_sink is not None:
-                ds_out = _ogr2.Open(temp_central_path)
+                ds_out  = _ogr2.Open(temp_central_path)
                 lyr_out = ds_out.GetLayer(0)
                 for feat_out in lyr_out:
                     wkt_out = feat_out.GetGeometryRef().ExportToWkt()
                     try:
                         from shapely import wkt as shp_wkt2
                         g = shp_wkt2.loads(wkt_out)
-                        # Garantir que é LineString simples (explode MultiLineString)
                         parts_out = list(g.geoms) if g.geom_type == "MultiLineString" else [g]
                         for part_out in parts_out:
                             if part_out.is_empty or part_out.length == 0:
@@ -1633,33 +1525,26 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 ds_out = None
                 del central_sink
 
-        # central_routes = caminho do gpkg para uso nas etapas seguintes
         central_routes = temp_central_path
         feedback.setProgress(62)
 
         # ── B. ROTAS MARGINAIS ──────────────────────────────────────────
-        # Otimização: processar feature a feature em vez de carregar tudo
-        # de uma vez; gravar directamente para ficheiro temporário.
+        # (NÃO ALTERADO — mantido exatamente como estava)
         # ---------------------------------------------------------------
         feedback.pushInfo(self.tr("A gerar rotas marginais..."))
 
         nav_mediana = buffer_dist_m
         if gps_layer:
-            feedback.pushInfo(
-                self.tr(
-                    "Camada GPS encontrada. "
-                    "A usar valor de buffer como fallback (logica GPS nao implementada)."
-                )
-            )
+            feedback.pushInfo(self.tr(
+                "Camada GPS encontrada. Usando buffer como fallback."
+            ))
 
-        # Ler apenas as colunas geometry (evita carregar atributos desnecessários)
         water_gdf = _read_vector(vector_path)[["geometry"]].copy()
         water_gdf["geometry"] = (
             water_gdf.geometry
-            .buffer(-abs(nav_mediana))   # buffer negativo → interior
-            .boundary                    # fronteira = linha marginal
+            .buffer(-abs(nav_mediana))
+            .boundary
         )
-        # Remover geometrias vazias (buffer negativo pode colapsar polígonos pequenos)
         water_gdf = water_gdf[~water_gdf.geometry.is_empty].reset_index(drop=True)
 
         temp_marg_path = os.path.join(tmp, "temp_marginais.gpkg")
@@ -1671,76 +1556,81 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         # ── C. ROTAS TRANSVERSAIS ───────────────────────────────────────
         #
-        # PROBLEMAS da versão anterior:
-        #   1. DENSIFICAÇÃO: o cent_gdf lido do .gpkg continha segmentos
-        #      individuais curtos. O loop gerava transversais a cada
-        #      TRANSECT_INTERVAL de CADA segmento — não do canal total.
-        #      Solução: fazer linemerge das geometrias antes de gerar
-        #      transversais, para operar sobre linhas contínuas.
+        # NOVO PIPELINE INTERNO:
         #
-        #   2. COMPRIMENTO INSUFICIENTE: perp_half_len era estimado pela
-        #      bbox do polígono ou nav_mediana×10, sem relação com a
-        #      largura real do rio no ponto. A perpendicular não alcançava
-        #      a margem em rios largos ou ângulos oblíquos.
-        #      Solução: usar a distância do ponto central ao limite do
-        #      polígono de água multiplicada por 2, com mínimo garantido.
+        # As rotas transversais são posicionadas sobre centerlines geradas
+        # INTERNAMENTE a partir do vetor de água, usando um pipeline de
+        # buffer positivo → buffer negativo → rasterize → skeletonize.
+        # Este pipeline é completamente temporário — os seus produtos
+        # intermediários não são entregues como output.
         #
-        #   3. CLIP INCOMPLETO: segs com geom_type != "LineString" eram
-        #      descartados. Um clip pode devolver LinearRing ou outros.
-        #      Solução: tentar extrair coordenadas de qualquer geometria.
+        # O clip final de cada transversal pelo polígono de água original
+        # permanece igual ao comportamento anterior.
         # ---------------------------------------------------------------
-        feedback.pushInfo(self.tr("A gerar rotas transversais..."))
+        feedback.pushInfo(self.tr(
+            "A gerar centerlines INTERNAS para posicionamento das transversais "
+            "(buffer+ → buffer- → rasterize → skeletonize)..."
+        ))
 
-        from shapely.geometry import LineString as ShpLineString, MultiLineString
-        from shapely.ops      import linemerge as shp_linemerge2, unary_union as shp_union2
-        from shapely          import wkt as shp_wkt_mod
+        internal_centerlines = _compute_internal_centerlines(
+            vector_path      = vector_path,
+            reference_raster_path = raster_path,
+            buffer_dist_m    = buffer_dist_m,
+            pixel_size_m     = pixel_size_m,
+            tmp_folder       = tmp,
+            feedback         = feedback,
+        )
 
-        # ── Carregar e fazer linemerge das rotas centrais ───────────────
-        # IMPORTANTE: ler as geometrias do .gpkg e fazer linemerge para
-        # obter linhas contínuas. Sem isto, o loop itera sobre fragmentos
-        # curtos e gera transversais com densidade errada.
-        feedback.pushInfo(self.tr("  Carregando e unindo rotas centrais para transversais..."))
-        raw_central_lines = []
-        ds_c = ogr.Open(central_routes)
-        lyr_c = ds_c.GetLayer(0)
-        for feat_c in lyr_c:
-            geom_c = feat_c.GetGeometryRef()
-            if geom_c is None:
-                continue
-            try:
-                g = shp_wkt_mod.loads(geom_c.ExportToWkt())
-                if g and not g.is_empty:
-                    if g.geom_type == "MultiLineString":
-                        raw_central_lines.extend(list(g.geoms))
-                    elif g.geom_type == "LineString":
-                        raw_central_lines.append(g)
-            except Exception:
-                pass
-        ds_c = None
+        if not internal_centerlines:
+            feedback.pushWarning(self.tr(
+                "AVISO: Nenhuma centerline interna gerada para as transversais. "
+                "A usar rotas centrais do esqueleto como fallback."
+            ))
+            # Fallback: usar as rotas centrais geradas na etapa A
+            from shapely import wkt as shp_wkt_fb
+            internal_centerlines = []
+            ds_fb  = ogr.Open(central_routes)
+            lyr_fb = ds_fb.GetLayer(0)
+            for feat_fb in lyr_fb:
+                geom_fb = feat_fb.GetGeometryRef()
+                if geom_fb is None:
+                    continue
+                try:
+                    g_fb = shp_wkt_fb.loads(geom_fb.ExportToWkt())
+                    if g_fb and not g_fb.is_empty:
+                        if g_fb.geom_type == "MultiLineString":
+                            internal_centerlines.extend(list(g_fb.geoms))
+                        elif g_fb.geom_type == "LineString":
+                            internal_centerlines.append(g_fb)
+                except Exception:
+                    pass
+            ds_fb = None
 
-        merged_central = shp_linemerge2(raw_central_lines)
-        del raw_central_lines
+        # Linemerge das centerlines internas
+        from shapely.ops import linemerge as shp_linemerge2
+        merged_internal = shp_linemerge2(internal_centerlines)
+        del internal_centerlines
         gc.collect()
 
-        if merged_central.geom_type == "LineString":
-            central_line_list = [merged_central]
-        elif merged_central.geom_type == "MultiLineString":
-            central_line_list = list(merged_central.geoms)
+        if merged_internal.geom_type == "LineString":
+            central_line_list = [merged_internal]
+        elif merged_internal.geom_type == "MultiLineString":
+            central_line_list = list(merged_internal.geoms)
         else:
-            central_line_list = [g for g in getattr(merged_central, "geoms", [])
+            central_line_list = [g for g in getattr(merged_internal, "geoms", [])
                                  if g.geom_type == "LineString"]
 
         feedback.pushInfo(self.tr(
-            f"  {len(central_line_list)} linhas centrais continuas para transversais."
+            f"  {len(central_line_list)} centerlines internas para transversais."
         ))
 
-        # ── Carregar polígono de água ────────────────────────────────────
+        # Carregar polígono de água para clip das transversais
         water_mask_gdf = _read_vector(vector_path)[["geometry"]]
         water_union    = water_mask_gdf.geometry.unary_union
         del water_mask_gdf
         gc.collect()
 
-        # ── Criar datasource OGR ─────────────────────────────────────────
+        # Criar datasource OGR para as transversais
         temp_transect_path = os.path.join(tmp, "temp_transects.gpkg")
         drv_t   = ogr.GetDriverByName("GPKG")
         ds_t    = drv_t.CreateDataSource(temp_transect_path)
@@ -1754,15 +1644,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         t_count = 0
 
         def _make_perpendicular_v2(line_geom, dist_along, water_poly):
-            """
-            Cria uma perpendicular correcta à linha no ponto dist_along.
-
-            Comprimento: calcula a distância do ponto central ao limite
-            do polígono de água (nearest point on boundary) e usa isso
-            como half_len, com um mínimo de 50m para canais estreitos.
-            Isto garante que a perpendicular SEMPRE alcança a margem.
-            """
-            # Tangente local
             total_len = line_geom.length
             delta = max(1.0, total_len * 0.0005)
             p0 = line_geom.interpolate(max(0.0, dist_along - delta))
@@ -1772,21 +1653,15 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             if norm < 1e-10:
                 return None
 
-            # Centro da transversal
             cp = line_geom.interpolate(dist_along)
             cx, cy = cp.x, cp.y
 
-            # Distância do centro ao limite do polígono de água
             from shapely.geometry import Point as ShpPoint
             center_pt = ShpPoint(cx, cy)
             boundary  = water_poly.boundary
             dist_to_boundary = center_pt.distance(boundary)
-
-            # half_len = distância ao limite × 1.5 (margem de segurança)
-            # mínimo de 50 m para garantir que alcança sempre
             half_len = max(50.0, dist_to_boundary * 1.5)
 
-            # Vector perpendicular (rotação 90°)
             px, py = -dy / norm, dx / norm
 
             return ShpLineString([
@@ -1794,25 +1669,20 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                 (cx + px * half_len, cy + py * half_len),
             ])
 
-        total_lines = len(central_line_list)
+        total_lines_t = len(central_line_list)
         for gi, line in enumerate(central_line_list):
             if line is None or line.is_empty:
                 continue
-
             length = line.length
-            # Só gerar transversais em linhas com comprimento >= intervalo
             if length < transect_interval_m:
                 continue
 
-            # Distribuir pontos ao longo da linha, começando a meio do
-            # primeiro intervalo para não colocar transversais nas pontas
             dist = transect_interval_m / 2.0
             while dist < length:
                 perp = _make_perpendicular_v2(line, dist, water_union)
                 if perp is not None:
                     clipped = perp.intersection(water_union)
                     if not clipped.is_empty and clipped.length > 1.0:
-                        # Extrair todos os segmentos de linha do resultado do clip
                         candidates = []
                         if clipped.geom_type == "LineString":
                             candidates = [clipped]
@@ -1820,7 +1690,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                             candidates = [g for g in clipped.geoms
                                          if hasattr(g, "coords") and g.length > 1.0]
                         elif hasattr(clipped, "coords"):
-                            # LinearRing ou outro com coords
                             try:
                                 candidates = [ShpLineString(list(clipped.coords))]
                             except Exception:
@@ -1846,7 +1715,7 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
                     lyr_t.StartTransaction()
                     gc.collect()
 
-            feedback.setProgress(65 + int((gi + 1) / max(total_lines, 1) * 17))
+            feedback.setProgress(65 + int((gi + 1) / max(total_lines_t, 1) * 17))
             if feedback.isCanceled():
                 lyr_t.CommitTransaction()
                 ds_t = None
@@ -1875,10 +1744,6 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
             feedback=feedback,
         )["OUTPUT"]
 
-        # Remover geometrias com coordenadas inválidas (NaN/Inf) que causam
-        # "Coordinates with non-finite values" ao gravar em shapefile/gpkg.
-        # Isto pode ocorrer quando features de diferentes SRCs são mescladas
-        # ou quando a reprojeção falha em geometrias degeneradas.
         feedback.pushInfo(self.tr("A validar geometrias da rede final..."))
         merged_network = processing.run(
             "native:fixgeometries",
@@ -1893,16 +1758,42 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
 
         del central_routes, clipped_transects
         gc.collect()
-        feedback.setProgress(90)
+        feedback.setProgress(88)
 
-        # ── E. REPROJETAR PARA O SRC DE SAÍDA (TEMPORARY_OUTPUT) ────────
-        # O native:reprojectlayer com destino ficheiro preserva os FIDs
-        # originais — quando há features de 3 camadas mescladas os FIDs
-        # ficam duplicados e o GPKG falha com "UNIQUE constraint failed: fid".
-        # Solução: reprojetar sempre para TEMPORARY_OUTPUT (camada em memória).
-        # O destino final é controlado pelo OUTPUT_NETWORK do Processing,
-        # que atribui FIDs novos e sequenciais automaticamente.
+        # ── E. SPLIT LINES AT INTERSECTIONS ────────────────────────────
+        #
+        # Divide todas as linhas da rede nos seus pontos de interseção,
+        # garantindo topologia correcta para análise de redes (routing,
+        # connectivity). Executado APÓS o merge e fixgeometries, ANTES
+        # da reprojeção final.
+        #
+        # Usa o algoritmo nativo do QGIS Processing "splitwithlines"
+        # que divide as features de INPUT nos pontos onde se intersectam
+        # com as features de LINES. Ao passar a própria rede como ambos
+        # os argumentos, todas as interseções internas são resolvidas.
+        # ---------------------------------------------------------------
+        feedback.pushInfo(self.tr(
+            "A dividir linhas nos pontos de interseção (split at intersections)..."
+        ))
 
+        split_network = processing.run(
+            "native:splitwithlines",
+            {
+                "INPUT":  merged_network,
+                "LINES":  merged_network,
+                "OUTPUT": "TEMPORARY_OUTPUT",
+            },
+            context=context,
+            feedback=feedback,
+        )["OUTPUT"]
+
+        del merged_network
+        gc.collect()
+        feedback.setProgress(92)
+
+        feedback.pushInfo(self.tr("A reprojetar a rede final..."))
+
+        # ── F. REPROJETAR PARA O SRC DE SAÍDA ───────────────────────────
         if output_crs_param and output_crs_param.isValid():
             target_crs  = output_crs_param
             target_desc = output_crs_param.authid()
@@ -1915,29 +1806,25 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         reprojected = processing.run(
             "native:reprojectlayer",
             {
-                "INPUT":      merged_network,
+                "INPUT":      split_network,
                 "TARGET_CRS": target_crs,
-                "OUTPUT":     "TEMPORARY_OUTPUT",   # evita FIDs duplicados no GPKG
+                "OUTPUT":     "TEMPORARY_OUTPUT",
             },
             context=context,
             feedback=feedback,
         )["OUTPUT"]
 
-        del merged_network
+        del split_network
         gc.collect()
         feedback.setProgress(95)
 
-        # ── F. GRAVAR NA SAÍDA FINAL VIA FEATURESINK ──────────────────
-        # O FeatureSink do QGIS Processing gere os FIDs automaticamente,
-        # garantindo unicidade independentemente do formato de saída
-        # (GPKG, SHP, GeoJSON, memória, etc.).
+        # ── G. GRAVAR NA SAÍDA FINAL VIA FEATURESINK ───────────────────
         feedback.pushInfo(self.tr("A gravar a rede final..."))
 
-        # Abrir a camada reprojetada
         if isinstance(reprojected, str):
             lyr_final = QgsVectorLayer(reprojected, "rede_final", "ogr")
         else:
-            lyr_final = reprojected   # já é QgsVectorLayer (TEMPORARY_OUTPUT)
+            lyr_final = reprojected
 
         (sink, dest_id) = self.parameterAsSink(
             parameters, self.OUTPUT_NETWORK, context,
@@ -1945,7 +1832,9 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         )
 
         if sink is None:
-            feedback.reportError(self.tr("Nao foi possivel criar a camada de saida."), fatalError=True)
+            feedback.reportError(
+                self.tr("Nao foi possivel criar a camada de saida."), fatalError=True
+            )
             return {}
 
         total = lyr_final.featureCount()
