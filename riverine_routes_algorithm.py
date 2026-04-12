@@ -748,13 +748,75 @@ class RiverineRoutesAlgorithm(QgsProcessingAlgorithm):
         temp_uint8_path = os.path.join(tmp, "temp_uint8.tif")
         temp_skel_path  = os.path.join(tmp, "temp_skeleton.tif")
 
+        # ── RASTERIZAR O VETOR PREENCHIDO ──────────────────────────────
+        # O INPUT_RASTER fornecido pelo utilizador foi gerado a partir do
+        # vetor original COM ilhas — o esqueleto contornaria as ilhas.
+        # Solução: rasterizar o vetor PREENCHIDO (sem ilhas) com a mesma
+        # resolução, extensão e CRS do raster original, e usar esse raster
+        # para o skeletonize e linhas centrais.
+        # O raster original continua a ser usado apenas para determinar
+        # a grade (resolução, extensão, CRS).
+        # ---------------------------------------------------------------
+        feedback.pushInfo(self.tr("  Rasterizando vetor preenchido (sem ilhas)..."))
+
+        temp_raster_filled_path = os.path.join(tmp, "temp_raster_filled.tif")
+        
+        with rasterio.open(raster_path) as src_ref:
+            ref_transform = src_ref.transform
+            ref_crs       = src_ref.crs
+            ref_height    = src_ref.height
+            ref_width     = src_ref.width
+            ref_dtype     = "uint8"
+
+        # Rasterizar usando rasterio.features.rasterize
+        from rasterio.features import rasterize as rio_rasterize
+        from shapely.geometry  import mapping as shp_mapping
+
+        gdf_rast = _read_vector(vector_path_for_skel)[["geometry"]]
+        shapes_for_rast = [(shp_mapping(geom), 1) for geom in gdf_rast.geometry
+                           if geom is not None and not geom.is_empty]
+        del gdf_rast
+        gc.collect()
+
+        filled_arr = rio_rasterize(
+            shapes_for_rast,
+            out_shape=(ref_height, ref_width),
+            transform=ref_transform,
+            fill=0,
+            dtype=ref_dtype,
+            all_touched=False,
+        )
+        del shapes_for_rast
+
+        profile_filled = {
+            "driver":    "GTiff",
+            "dtype":     ref_dtype,
+            "count":     1,
+            "height":    ref_height,
+            "width":     ref_width,
+            "crs":       ref_crs,
+            "transform": ref_transform,
+            "compress":  "lzw",
+            "tiled":     True,
+            "blockxsize": 512,
+            "blockysize": 512,
+        }
+        with rasterio.open(temp_raster_filled_path, "w", **profile_filled) as dst_fill:
+            dst_fill.write(filled_arr, 1)
+        del filled_arr
+        gc.collect()
+        feedback.pushInfo(self.tr("  Raster preenchido gerado. A usar para skeletonize."))
+
+        # Usar o raster preenchido como fonte para o skeletonize
+        raster_path_for_skel = temp_raster_filled_path
+        
         # FASE 1: ler em blocos, gravar uint8 comprimido
-        with rasterio.open(raster_path) as src:
+        with rasterio.open(raster_path_for_skel) as src:
             transform = src.transform
             crs       = src.crs
             height    = src.height
             width     = src.width
-
+            
             # Blocos de leitura: linhas suficientes para ~64 MB por bloco
             # (seguro mesmo com pouca RAM disponível nesta fase)
             bytes_per_row = width  # uint8 = 1 byte/pixel após conversão
